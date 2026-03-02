@@ -1,0 +1,65 @@
+[package]
+name = "gork-agent"
+version = "0.1.0"
+edition = "2021"
+authors = ["Gork <irongork.near>"]
+description = "P2P agent-to-agent communication protocol with NEAR integration"
+license = "MIT"
+
+[[bin]]
+name = "gork-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# P2P networking
+libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "relay", "macros"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# NEAR integration
+near-crypto = "0.28"
+bs58 = "0.5"
+
+# Storage
+rocksdb = "0.22"
+
+# Cryptography
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+base64 = "0.22"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.11", features = ["json"] }
+regex = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true

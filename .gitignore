@@ -1,0 +1,5 @@
+/target
+/.gork-agent
+Cargo.lock
+*.log
+.DS_Store
