@@ -1,0 +1,86 @@
+# Example Agent Skill - CSV Analyzer
+# Following Agent Skills format (agentskills.io)
+
+name: csv-analyzer
+version: 1.0.0
+description: Analyze CSV files and generate statistics, summaries, and visualizations
+
+author: alice.near
+
+tags:
+  - data
+  - csv
+  - python
+  - analytics
+
+license: MIT
+homepage: https://github.com/alice/csv-analyzer-skill
+repository: https://github.com/alice/csv-analyzer-skill
+
+# Capabilities provided by this skill
+capabilities:
+  - name: analyze
+    description: Analyze a CSV file and return statistics
+    input_schema: |
+      {
+        "type": "object",
+        "properties": {
+          "file_path": {"type": "string"},
+          "columns": {"type": "array", "items": {"type": "string"}},
+          "operations": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["mean", "median", "mode", "std", "min", "max", "count"]
+            }
+          }
+        },
+        "required": ["file_path"]
+      }
+    output_schema: |
+      {
+        "type": "object",
+        "properties": {
+          "row_count": {"type": "integer"},
+          "column_stats": {"type": "object"},
+          "summary": {"type": "string"}
+        }
+      }
+    examples:
+      - '{"file_path": "data.csv", "columns": ["age", "salary"], "operations": ["mean", "median"]}'
+
+  - name: summarize
+    description: Generate a natural language summary of CSV data
+    input_schema: |
+      {
+        "type": "object",
+        "properties": {
+          "file_path": {"type": "string"},
+          "max_length": {"type": "integer", "default": 500}
+        },
+        "required": ["file_path"]
+      }
+    output_schema: |
+      {
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"},
+          "key_insights": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    examples:
+      - '{"file_path": "sales.csv"}'
+
+# Resource requirements
+requirements:
+  timeout_secs: 60
+  memory_mb: 1024
+  dependencies:
+    - python>=3.9
+    - pandas>=2.0
+    - numpy>=1.24
+
+# Pricing (optional)
+pricing:
+  free_tier_calls_per_day: 100
+  cost_per_call_yocto: "1000000000000"  # 0.001 NEAR per call

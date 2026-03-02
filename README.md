@@ -5,9 +5,11 @@ P2P agent-to-agent communication with NEAR blockchain integration.
 ## Features
 
 - **NEAR-native identity** - Your wallet is your agent ID
+- **Mandatory NEAR verification** - All agents must prove NEAR account ownership
 - **End-to-end encryption** - X25519 + ChaCha20-Poly1305
 - **Local storage** - RocksDB for offline-capable messaging
-- **P2P networking** - libp2p for decentralized communication (Phase 3)
+- **P2P networking** - libp2p with gossipsub, Kademlia DHT, and relay support
+- **NAT traversal** - Circuit relay for peers behind firewalls
 
 ## Installation
 
@@ -63,28 +65,29 @@ cargo build --release
 └──────────────────────────────────────────────────────────┘
 ```
 
-## Implementation Phases
+## Implementation Status
 
-### Phase 1: Core Identity + Messaging ✅ (Current)
+### ✅ Phase 1: Core Identity + Messaging (Complete)
 - [x] Project scaffold
 - [x] NEAR identity creation
 - [x] CLI interface
 - [x] Local storage (RocksDB)
 - [x] Basic encryption
 
-### Phase 2: NEAR Registry Contract
+### ✅ Phase 3: P2P Networking (Complete)
+- [x] libp2p integration
+- [x] Gossipsub pub/sub messaging
+- [x] Kademlia DHT for peer discovery
+- [x] NAT traversal via relay
+- [x] Bootstrap peer support
+
+### 🚧 Phase 2: NEAR Registry Contract (Pending)
 - [ ] AgentRegistry contract
 - [ ] Deploy to testnet
 - [ ] Discovery commands
 - [ ] On-chain identity
 
-### Phase 3: P2P Networking
-- [ ] libp2p integration
-- [ ] Gossipsub messaging
-- [ ] Kademlia DHT
-- [ ] NAT traversal
-
-### Phase 4: Capability Negotiation
+### 🚧 Phase 4: Capability Negotiation (Pending)
 - [ ] Request/Response protocol
 - [ ] Timeout handling
 - [ ] NEAR payments
@@ -102,7 +105,32 @@ cargo build --release
 | `clear` | Clear inbox |
 | `advertise` | Add capability to agent |
 | `discover` | Find agents by capability (Phase 2) |
-| `daemon` | Start P2P node (Phase 3) |
+| `daemon` | Start P2P node with optional bootstrap peers |
+| `relay` | Start P2P relay server for NAT traversal |
+
+## Documentation
+
+- **[Relay Quick Start](docs/RELAY_QUICKSTART.md)** - Deploy a P2P relay
+- **[Relay Design](docs/RELAY_DESIGN.md)** - Architecture and theory
+- **[Relay Test Results](docs/RELAY_TEST_RESULTS.md)** - E2E test results
+- **[Mandatory NEAR Verification](docs/MANDATORY_NEAR_VERIFICATION.md)** - Security model
+- **[Peer Authentication](docs/PEER_AUTHENTICATION.md)** - Authentication protocol
+- **[Message Security](docs/MESSAGE_SECURITY.md)** - Encryption details
+- **[Security Overview](docs/SECURITY.md)** - Full security documentation
+
+## Tests
+
+See the `tests/` directory for automated test scripts:
+
+```bash
+# End-to-end relay test (tests peer connection via relay)
+./tests/test-relay-e2e.sh
+
+# Two-agent local communication test
+./tests/test_two_agents.sh
+```
+
+**Test Results:** ✅ All tests passing - relay successfully facilitates peer discovery and NAT traversal
 
 ## Development
 

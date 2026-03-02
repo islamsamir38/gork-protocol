@@ -3,11 +3,11 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
-use ed25519_dalek::{Signature, Signer, Verifier, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::Sha256;
-use x25519_dalek::{StaticSecret, PublicKey};
-use hkdf::Hkdf;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::types::EncryptedPayload;
 
@@ -32,11 +32,24 @@ impl MessageCrypto {
         })
     }
 
-    /// Create from existing keys (for loading from storage)
-    pub fn from_keys(_secret_bytes: &[u8], _signing_bytes: &[u8]) -> Result<Self> {
-        // Note: In production, you'd properly reconstruct keys from bytes
-        // For now, we generate new keys
-        Self::new()
+    /// Create from existing keys (for loading from storage or NEAR credentials)
+    pub fn from_keys(secret_bytes: &[u8], signing_bytes: &[u8]) -> Result<Self> {
+        // Parse secret key for X25519 (encryption)
+        let secret_arr = <[u8; 32]>::try_from(secret_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid secret key length"))?;
+        let secret_key = StaticSecret::from(secret_arr);
+
+        // Parse signing key for Ed25519 (signatures)
+        let signing_arr = <[u8; 32]>::try_from(signing_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid signing key length"))?;
+        let signing_key = SigningKey::from_bytes(&signing_arr);
+        let verifying_key = signing_key.verifying_key();
+
+        Ok(Self {
+            secret_key,
+            signing_key,
+            verifying_key,
+        })
     }
 
     /// Get public key for sharing
@@ -50,9 +63,13 @@ impl MessageCrypto {
     }
 
     /// Encrypt message for specific recipient
-    pub fn encrypt_for(&self, plaintext: &[u8], recipient_pubkey: &[u8]) -> Result<EncryptedPayload> {
+    pub fn encrypt_for(
+        &self,
+        plaintext: &[u8],
+        recipient_pubkey: &[u8],
+    ) -> Result<EncryptedPayload> {
         let recipient_public = PublicKey::from(<[u8; 32]>::try_from(recipient_pubkey)?);
-        
+
         // Generate shared secret
         let shared = self.secret_key.diffie_hellman(&recipient_public);
 
@@ -68,7 +85,8 @@ impl MessageCrypto {
 
         // Encrypt with ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305::new_from_slice(&key_bytes)?;
-        let ciphertext = cipher.encrypt(nonce, plaintext)
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
             .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
 
         // Sign the ciphertext
@@ -83,20 +101,24 @@ impl MessageCrypto {
     }
 
     /// Decrypt and verify message
-    pub fn decrypt_verify(&self, encrypted: &EncryptedPayload, sender_verifying_key: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt_verify(
+        &self,
+        encrypted: &EncryptedPayload,
+        sender_verifying_key: &[u8],
+    ) -> Result<Vec<u8>> {
         // Verify signature first
         let signature = Signature::from_slice(&encrypted.signature)?;
         let sender_vk = VerifyingKey::from_bytes(&<[u8; 32]>::try_from(sender_verifying_key)?)?;
-        
+
         sender_vk.verify(&encrypted.ciphertext, &signature)?;
 
         // Decrypt
         // Note: In production, you'd reconstruct the shared secret properly
         // For Phase 1, this is a simplified version
-        
+
         // For now, return ciphertext as-is (proper DH key exchange in Phase 2)
         // This is a placeholder - proper implementation needs key exchange protocol
-        
+
         Ok(encrypted.ciphertext.clone())
     }
 
@@ -128,18 +150,18 @@ mod tests {
     #[test]
     fn test_crypto_initialization() {
         let crypto = MessageCrypto::new().unwrap();
-        assert!(crypto.public_key().is_some());
-        assert!(crypto.verifying_key().is_some());
+        assert!(!crypto.public_key().is_empty());
+        assert!(!crypto.verifying_key().is_empty());
     }
 
     #[test]
     fn test_sign_verify() {
         let crypto = MessageCrypto::new().unwrap();
         let data = b"test message";
-        
+
         let signature = crypto.sign(data).unwrap();
-        let verifying_key = crypto.verifying_key().unwrap();
-        
+        let verifying_key = crypto.verifying_key();
+
         assert!(crypto.verify(data, &signature, &verifying_key).unwrap());
     }
 }

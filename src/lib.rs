@@ -1,5 +1,5 @@
 //! Gork Agent Protocol
-//! 
+//!
 //! P2P agent-to-agent communication with NEAR integration
 
 pub mod types;
@@ -9,6 +9,7 @@ pub mod near;
 pub mod registry;
 pub mod security;
 pub mod network;
+pub mod auth;
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -53,6 +54,7 @@ impl Agent {
             identity,
             storage_path: storage_path.to_string_lossy().to_string(),
             network_id: network.to_string(),
+            near_verified: false, // Library API doesn't require NEAR verification
         };
 
         storage.save_config(&config)?;

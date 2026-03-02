@@ -1,5 +1,29 @@
+# Build artifacts
 /target
-/.gork-agent
+**/target/
 Cargo.lock
+
+# Contract artifacts
+*.wasm
+*.abi.json
+
+# Agent data
+/.gork-agent
+/.gork-peer*
+/.near-credentials
+
+# Test artifacts
+/tmp/relay.log
+/tmp/peer*.log
 *.log
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

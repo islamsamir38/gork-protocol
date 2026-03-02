@@ -120,6 +120,8 @@ pub struct AgentConfig {
     pub identity: AgentIdentity,
     pub storage_path: String,
     pub network_id: String,
+    /// Whether this agent was initialized with NEAR verification
+    pub near_verified: bool,
 }
 
 impl Default for AgentConfig {
@@ -128,6 +130,7 @@ impl Default for AgentConfig {
             identity: AgentIdentity::new(String::new(), Vec::new()),
             storage_path: ".gork-agent".to_string(),
             network_id: "testnet".to_string(),
+            near_verified: false,
         }
     }
 }
