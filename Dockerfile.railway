@@ -27,13 +27,15 @@ RUN apt-get update && apt-get install -y \
 # Copy binary from builder
 COPY --from=builder /app/target/release/gork-agent /usr/local/bin/gork-agent
 
-# Copy pre-built config
+# Create non-root user first
+RUN useradd -m -u 1000 gork
+
+# Create config directory and copy config
+RUN mkdir -p /home/gork/.gork-agent
 COPY relay-config.json /home/gork/.gork-agent/config.json
 
-# Create non-root user
-RUN useradd -m -u 1000 gork && \
-    mkdir -p /home/gork/.gork-agent && \
-    chown -R gork:gork /home/gork
+# Fix permissions
+RUN chown -R gork:gork /home/gork
 
 USER gork
 
