@@ -15,7 +15,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # P2P networking
-libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "relay", "macros", "tokio"] }
+libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "relay", "macros", "tokio", "autonat", "dcutr", "rendezvous"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

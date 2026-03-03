@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -10,10 +10,12 @@ mod crypto;
 mod near;
 mod network;
 mod registry;
+mod relay;
 mod security;
 mod skills;
 mod storage;
 mod types;
+mod load_balancing;
 
 use crate::types::AgentIdentity;
 
@@ -1116,17 +1118,17 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>) -> Result<()> 
 /// Start a minimal P2P relay server
 async fn start_relay(
     port: u16,
-    _max_circuits: usize,
+    max_circuits: usize,
     enable_metrics: bool,
     metrics_port: u16,
 ) -> Result<()> {
     println!();
     println!("{}:", "=".repeat(60));
-    println!("🌐 Gork Agent Relay Server");
+    println!("🌐 Gork Hybrid Relay Server");
     println!("{}:", "=".repeat(60));
     println!();
 
-    // Load agent identity (must be initialized)
+    // Check agent initialization
     let storage_path = get_storage_path();
     if !storage_path.exists() {
         println!("❌ No agent initialized. Run: gork-agent init --account <your.near>");
@@ -1145,11 +1147,6 @@ async fn start_relay(
         println!("⚠️  WARNING: Relay not NEAR-verified!");
         println!("   Peers may refuse to use this relay.");
         println!();
-        println!("For production, reinitialize with NEAR verification:");
-        println!("  1. near login --account-id {}", config.identity.account_id);
-        println!("  2. rm -rf ~/.gork-agent");
-        println!("  3. gork-agent init --account {}", config.identity.account_id);
-        println!();
         println!("Starting anyway in 3 seconds... (Ctrl+C to cancel)");
         std::thread::sleep(std::time::Duration::from_secs(3));
         println!();
@@ -1157,47 +1154,76 @@ async fn start_relay(
 
     println!("🤖 Relay Identity: {}", config.identity.account_id);
     println!("📡 Port: {}", port);
-    if enable_metrics {
-        println!("📊 Metrics: http://0.0.0.0:{}", metrics_port);
-    }
+    println!("🔌 Max circuits: {}", max_circuits);
     println!();
 
-    // Create event channel
-    let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
-
-    // Create network config
-    let network_config = network::NetworkConfig {
+    // Create relay configuration
+    let relay_config = relay::RelayConfig {
         port,
-        bootstrap_peers: vec![],
+        max_circuits,
+        max_circuit_duration_secs: 120,
+        max_circuit_bytes: 1024 * 1024,
+        enable_metrics,
+        metrics_port,
     };
 
-    // Create network (relays don't need to enforce auth, they just forward)
-    let mut p2p_network = network::AgentNetwork::with_auth(
-        config.identity.clone(),
-        network_config,
-        event_sender,
-        None,
-        false,  // Relays accept all peers
-    )
-    .await?;
+    // Create relay server
+    let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut relay_server = relay::RelayServer::with_events(relay_config.clone(), event_sender).await?;
 
     // Start listening
-    let listen_addr = p2p_network.listen(Some(port)).await?;
+    let listen_addr = relay_server.listen().await?;
     println!("✅ Relay listening on: {}", listen_addr);
-    println!("   Peer ID: {}", p2p_network.peer_id());
+    println!("   Peer ID: {}", relay_server.peer_id);
     println!();
 
-    // Print connection info for peers
-    println!("📝 For peers to connect via this relay:");
-    println!("   Use: --bootstrap-peers /ip4/<YOUR-IP>/tcp/{}/p2p/{}", port, p2p_network.peer_id());
+    // Print connection strings for different scenarios
+    println!("📝 Connection strings for peers:");
+    println!();
+    println!("   Localhost:");
+    println!("     {}", relay_server.connection_string("127.0.0.1"));
+    println!();
+    println!("   LAN (find your IP with 'ip addr' or 'ifconfig'):");
+    println!("     /ip4/<YOUR-LAN-IP>/tcp/{}/p2p/{}", port, relay_server.peer_id);
+    println!();
+    println!("   Public (requires public IP):");
+    println!("     /ip4/<YOUR-PUBLIC-IP>/tcp/{}/p2p/{}", port, relay_server.peer_id);
+    println!();
+
+    println!("🔧 Relay Roles:");
+    println!("   1️⃣  Bootstrap Node - Peer discovery via Kademlia DHT");
+    println!("   2️⃣  Rendezvous - Coordinate hole punching between peers");
+    println!("   3️⃣  Circuit Relay - Fallback for symmetric NAT/CGNAT");
     println!();
 
     // Start metrics server if enabled
     if enable_metrics {
         let metrics_port = metrics_port;
-        let peer_id = p2p_network.peer_id().to_string();
+        let peer_id = relay_server.peer_id.to_string();
+        let (stats_tx, stats_rx) = tokio::sync::mpsc::channel(16);
+        
+        println!("📊 Metrics: http://0.0.0.0:{}", metrics_port);
+        
         tokio::spawn(async move {
-            simple_metrics_server(metrics_port, peer_id).await;
+            relay::start_metrics_server(metrics_port, peer_id, stats_rx).await;
+        });
+
+        // Spawn stats reporter
+        let stats_tx_clone = stats_tx.clone();
+        let relay_peer_id = relay_server.peer_id.to_string();
+        let relay_port = relay_server.config.port;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                // Send basic stats (can't access swarm from different thread)
+                let stats = relay::RelayStats {
+                    peer_id: relay_peer_id.clone(),
+                    port: relay_port,
+                    connected_peers: 0,
+                };
+                let _ = stats_tx_clone.send(stats).await;
+            }
         });
     }
 
@@ -1205,19 +1231,41 @@ async fn start_relay(
     println!("   Press Ctrl+C to stop");
     println!();
 
-    // Spawn connection counter
-    let mut connection_count = 0;
+    // Event monitoring task
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            info!("📊 Relay status: Running, waiting for connections...");
+        while let Some(event) = event_receiver.recv().await {
+            match event {
+                relay::RelayEvent::PeerConnected(peer) => {
+                    info!("✅ Peer connected: {}", peer);
+                }
+                relay::RelayEvent::PeerDisconnected(peer) => {
+                    info!("❌ Peer disconnected: {}", peer);
+                }
+                relay::RelayEvent::CircuitEstablished { src, dst } => {
+                    info!("🔀 Circuit established: {} → {}", src, dst);
+                }
+                relay::RelayEvent::CircuitClosed { src, dst } => {
+                    info!("🔌 Circuit closed: {} → {}", src, dst);
+                }
+                relay::RelayEvent::Error(e) => {
+                    error!("Relay error: {}", e);
+                }
+            }
         }
     });
 
-    // Run network event loop
+    // Status reporter
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            info!("📊 Relay status: running");
+        }
+    });
+
+    // Run relay event loop
     tokio::select! {
-        _ = p2p_network.run() => {
+        _ = relay_server.run() => {
             // This will run forever until Ctrl+C
         }
 
@@ -1228,60 +1276,6 @@ async fn start_relay(
 
     println!("👋 Relay stopped");
     Ok(())
-}
-
-/// Ultra-simple metrics server (no external dependencies)
-async fn simple_metrics_server(port: u16, peer_id: String) {
-    use tokio::net::TcpListener;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => {
-            info!("📊 Metrics server listening on http://0.0.0.0:{}", port);
-            l
-        }
-        Err(e) => {
-            warn!("Failed to start metrics server: {}", e);
-            return;
-        }
-    };
-
-    loop {
-        match listener.accept().await {
-            Ok((mut socket, _)) => {
-                let peer_id = peer_id.clone();
-                tokio::spawn(async move {
-                    let mut buffer = [0; 1024];
-                    if let Ok(n) = socket.read(&mut buffer).await {
-                        let request = String::from_utf8_lossy(&buffer[..n]);
-
-                        let response = if request.contains("GET /metrics") {
-                            format!(
-                                "# HELP gork_relay_up Relay is running\n\
-                                 # TYPE gork_relay_up gauge\n\
-                                 gork_relay_up 1\n\
-                                 # HELP gork_relay_peer_id Relay peer ID\n\
-                                 # TYPE gork_relay_peer_id gauge\n\
-                                 gork_relay_peer_id \"{}\"\n\
-                                 # EOF\n",
-                                peer_id
-                            )
-                        } else if request.contains("GET /health") {
-                            "{\"status\":\"healthy\",\"relay\":\"gork-agent-relay\"}\n".to_string()
-                        } else {
-                            "HTTP/1.1 404 Not Found\n\n".to_string()
-                        };
-
-                        let _ = socket.write_all(response.as_bytes()).await;
-                    }
-                });
-            }
-            Err(e) => {
-                warn!("Metrics server error: {}", e);
-            }
-        }
-    }
 }
 
 /// Handle Skills commands

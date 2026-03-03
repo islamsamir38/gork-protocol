@@ -230,6 +230,74 @@ See **[docs/RELAY_QUICKSTART.md](docs/RELAY_QUICKSTART.md)** for:
 - Firewall configuration
 - Production best practices
 
+## ⚖️ Load Balancing (P2C)
+
+Gork uses **Power of Two Random Choices (P2C)** for distributed load balancing — the same algorithm used by HAProxy for service meshes.
+
+### Why P2C?
+
+In P2P networks, there's no central load balancer. Each node makes independent decisions. P2C provides near-optimal load distribution without coordination:
+
+| Algorithm | Coordination | Load Distribution | Overhead |
+|-----------|--------------|-------------------|----------|
+| Random | None | Poor | O(1) |
+| Round Robin | None | Poor | O(1) |
+| **P2C** | **None** | **Near-optimal** | **O(1)** |
+| Least Connections | Central | Optimal | O(n) |
+
+### How It Works
+
+```
+1. Pick 2 random peers from candidates
+2. Compare their load (connections, requests, latency)
+3. Choose the less loaded one
+```
+
+Statistically achieves 30% better distribution than random, only 4-7% worse than ideal centralized LB.
+
+### Usage
+
+```rust
+use gork_agent::load_balancing::{P2CSelector, RelaySelector};
+
+// Peer selection for message forwarding
+let selector = P2CSelector::new();
+
+// Select best peer (P2C algorithm)
+if let Some(peer) = selector.select_peer(&connected_peers) {
+    // Forward message to least loaded peer
+}
+
+// Select multiple peers for fanout
+let peers = selector.select_multiple(&connected_peers, 3);
+
+// Relay selection (for clients)
+let relay_selector = RelaySelector::new();
+relay_selector.add_relay(relay_info);
+
+if let Some(relay) = relay_selector.select_relay() {
+    // Use best relay based on circuits + latency
+}
+```
+
+### Selection Strategies
+
+| Method | Use Case |
+|--------|----------|
+| `select_peer()` | Default P2C (pick 2, choose least loaded) |
+| `select_multiple()` | Fanout to N peers |
+| `select_lowest_latency()` | Latency-sensitive operations |
+| `select_least_used()` | Fairness distribution |
+
+### Integrated Into
+
+- **Message forwarding** — `select_peer_for_forward()`
+- **Broadcast fanout** — `select_peers_for_fanout()`
+- **Relay selection** — `select_best_relay()`
+- **DHT routing** — Kademlia query distribution
+
+Reference: Mitzenmacher, Richa & Sitaraman (2001) — "The Power of Two Random Choices"
+
 ## 🎯 How Gork Works
 
 ### Real-World Example

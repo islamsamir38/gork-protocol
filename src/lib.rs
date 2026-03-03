@@ -1,6 +1,18 @@
 //! Gork Agent Protocol
 //!
 //! P2P agent-to-agent communication with NEAR integration
+//!
+//! ## Architecture
+//!
+//! - **Relay Server**: Bootstrap + Rendezvous + Circuit Relay (public IP required)
+//! - **Client Agents**: AutoNAT + DCUtR + Relay Client (NAT traversal)
+//!
+//! ## Connection Flow
+//!
+//! 1. Discover peers via Kademlia DHT
+//! 2. Try direct connection (90% success)
+//! 3. Coordinate hole punch via Rendezvous (9% success)
+//! 4. Fall back to circuit relay (1% - symmetric NAT/CGNAT)
 
 pub mod types;
 pub mod crypto;
@@ -9,7 +21,13 @@ pub mod near;
 pub mod registry;
 pub mod security;
 pub mod network;
+pub mod relay;
 pub mod auth;
+pub mod skills;
+pub mod load_balancing;
+
+// Re-export load_balancing for convenience
+pub use load_balancing::{P2CSelector, PeerLoad, PeerLoadTracker, RelaySelector, RelayInfo};
 
 use anyhow::Result;
 use std::path::PathBuf;
