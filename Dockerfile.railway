@@ -27,16 +27,14 @@ RUN apt-get update && apt-get install -y \
 # Copy binary from builder
 COPY --from=builder /app/target/release/gork-agent /usr/local/bin/gork-agent
 
+# Copy pre-built config
+COPY relay-config.json /home/gork/.gork-agent/config.json
+
 # Create non-root user
-RUN useradd -m -u 1000 gork
+RUN useradd -m -u 1000 gork && \
+    mkdir -p /home/gork/.gork-agent && \
+    chown -R gork:gork /home/gork
 
-# Create gork home directory and initialize agent
-ENV HOME=/home/gork
-RUN mkdir -p /home/gork/.gork-agent && \
-    chown -R gork:gork /home/gork && \
-    gork-agent init --account relay.gork.protocol --dev-mode
-
-# Now switch to gork user
 USER gork
 
 # Expose ports

@@ -1,0 +1,12 @@
+{
+  "identity": {
+    "account_id": "relay.gork.protocol",
+    "public_key": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    "capabilities": ["relay"],
+    "endpoint": null,
+    "created_at": 1700000000000
+  },
+  "storage_path": ".gork-agent",
+  "network_id": "testnet",
+  "near_verified": false
+}
