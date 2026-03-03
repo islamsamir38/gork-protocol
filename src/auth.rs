@@ -13,6 +13,7 @@
 //! - History factor (10%): Completed jobs/contracts in the system
 
 use anyhow::{anyhow, Result};
+use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1489,6 +1490,334 @@ impl P2PMessageEnvelope {
         };
         let signature = Signature::from_bytes(&sig_bytes);
         verifying_key.verify(&message_bytes, &signature).is_ok()
+    }
+}
+
+// ============================================================================
+// NEAR DNS RESOLVER
+// ============================================================================
+
+/// DNS record returned from NEAR DNS contract
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NearDnsRecord {
+    pub record_type: String,
+    pub value: String,
+    pub ttl: u64,
+    pub priority: Option<u64>,
+}
+
+/// NEAR DNS resolver for decentralized peer discovery
+pub struct NearDnsResolver {
+    http_client: Client,
+    network: Network,
+    cache: HashMap<String, (Vec<NearDnsRecord>, u64)>,  // (records, timestamp)
+    cache_ttl_secs: u64,
+}
+
+impl NearDnsResolver {
+    /// Create a new DNS resolver
+    pub fn new(network: Network) -> Self {
+        Self {
+            http_client: Client::new(),
+            network,
+            cache: HashMap::new(),
+            cache_ttl_secs: 300,  // 5 minutes
+        }
+    }
+
+    /// Resolve a domain name via NEAR DNS contract
+    /// 
+    /// # Example
+    /// ```
+    /// let resolver = NearDnsResolver::new(Network::Mainnet);
+    /// let records = resolver.resolve("gork.jemartel.near", "A").await?;
+    /// ```
+    pub async fn resolve(&mut self, domain: &str, record_type: &str) -> Result<Vec<NearDnsRecord>> {
+        // Check cache first
+        let cache_key = format!("{}:{}", domain, record_type);
+        let now = current_timestamp();
+        
+        if let Some((records, ts)) = self.cache.get(&cache_key) {
+            if now - ts < self.cache_ttl_secs {
+                info!("DNS cache hit for {} {}", record_type, domain);
+                return Ok(records.clone());
+            }
+        }
+
+        // Parse domain to get contract and name
+        let (dns_contract, name) = self.parse_domain(domain)?;
+
+        // Query the DNS contract
+        let records = self.query_dns_contract(&dns_contract, &name, record_type).await?;
+
+        // Cache the result
+        self.cache.insert(cache_key, (records.clone(), now));
+
+        info!("Resolved {} {} → {} records", record_type, domain, records.len());
+        Ok(records)
+    }
+
+    /// Resolve all record types for a domain
+    pub async fn resolve_all(&mut self, domain: &str) -> Result<Vec<NearDnsRecord>> {
+        let (dns_contract, name) = self.parse_domain(domain)?;
+        self.query_dns_contract_all(&dns_contract, &name).await
+    }
+
+    /// Parse domain like "gork.jemartel.near" into ("dns.jemartel.near", "gork")
+    fn parse_domain(&self, domain: &str) -> Result<(String, String)> {
+        let parts: Vec<&str> = domain.split('.').collect();
+        
+        if parts.len() < 3 {
+            return Err(anyhow!("Invalid NEAR domain: {}", domain));
+        }
+
+        // gork.jemartel.near → dns.jemartel.near, gork
+        let tld = parts.last().ok_or_else(|| anyhow!("No TLD"))?;
+        let dns_contract = format!("dns.{}.{}", parts[parts.len() - 2], tld);
+        let name = parts[0];
+
+        Ok((dns_contract, name.to_string()))
+    }
+
+    /// Query DNS contract for specific record type
+    async fn query_dns_contract(
+        &self,
+        contract: &str,
+        name: &str,
+        record_type: &str,
+    ) -> Result<Vec<NearDnsRecord>> {
+        let args = serde_json::json!({
+            "name": name,
+            "record_type": record_type
+        });
+        
+        let args_base64 = general_purpose::STANDARD
+            .encode(serde_json::to_vec(&args)?);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": {
+                "request_type": "call_function",
+                "finality": "final",
+                "account_id": contract,
+                "method_name": "dns_query",
+                "args_base64": args_base64
+            }
+        });
+
+        let response = self.http_client
+            .post(self.network.rpc_url())
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("DNS query failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("DNS RPC error: {}", response.status()));
+        }
+
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse DNS response: {}", e))?;
+
+        // Extract result from NEAR RPC response
+        let result_bytes = result
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow!("No DNS records found"))?;
+
+        // Decode the result bytes
+        let bytes: Vec<u8> = result_bytes
+            .iter()
+            .filter_map(|b| b.as_u64().map(|v| v as u8))
+            .collect();
+
+        // Parse the DNS records
+        if bytes.is_empty() || bytes == vec![0] {
+            return Ok(vec![]);  // No records
+        }
+
+        let records: Vec<NearDnsRecord> = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| {
+                // Try parsing as single record
+                if let Ok(record) = serde_json::from_slice::<NearDnsRecord>(&bytes) {
+                    vec![record]
+                } else {
+                    vec![]
+                }
+            });
+
+        Ok(records)
+    }
+
+    /// Query DNS contract for all records of a name
+    async fn query_dns_contract_all(
+        &self,
+        contract: &str,
+        name: &str,
+    ) -> Result<Vec<NearDnsRecord>> {
+        let args = serde_json::json!({
+            "name": name
+        });
+        
+        let args_base64 = general_purpose::STANDARD
+            .encode(serde_json::to_vec(&args)?);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": {
+                "request_type": "call_function",
+                "finality": "final",
+                "account_id": contract,
+                "method_name": "dns_query_all",
+                "args_base64": args_base64
+            }
+        });
+
+        let response = self.http_client
+            .post(self.network.rpc_url())
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("DNS query failed: {}", e))?;
+
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse DNS response: {}", e))?;
+
+        let result_bytes = result
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow!("No DNS records found"))?;
+
+        let bytes: Vec<u8> = result_bytes
+            .iter()
+            .filter_map(|b| b.as_u64().map(|v| v as u8))
+            .collect();
+
+        if bytes.is_empty() || bytes == vec![0] {
+            return Ok(vec![]);
+        }
+
+        let records: Vec<NearDnsRecord> = serde_json::from_slice(&bytes)
+            .unwrap_or_default();
+
+        Ok(records)
+    }
+
+    /// List all DNS names in a contract
+    pub async fn list_names(&self, contract: &str) -> Result<Vec<String>> {
+        let args = serde_json::json!({});
+        let args_base64 = general_purpose::STANDARD
+            .encode(serde_json::to_vec(&args)?);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": {
+                "request_type": "call_function",
+                "finality": "final",
+                "account_id": contract,
+                "method_name": "dns_list_names",
+                "args_base64": args_base64
+            }
+        });
+
+        let response = self.http_client
+            .post(self.network.rpc_url())
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+
+        let result: serde_json::Value = response.json().await?;
+
+        let result_bytes = result
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow!("No names found"))?;
+
+        let bytes: Vec<u8> = result_bytes
+            .iter()
+            .filter_map(|b| b.as_u64().map(|v| v as u8))
+            .collect();
+
+        let names: Vec<String> = serde_json::from_slice(&bytes)
+            .unwrap_or_default();
+
+        Ok(names)
+    }
+
+    /// Get first A record IP address for a domain
+    pub async fn resolve_ip(&mut self, domain: &str) -> Result<Option<String>> {
+        let records = self.resolve(domain, "A").await?;
+        Ok(records.first().map(|r| r.value.clone()))
+    }
+
+    /// Get TXT record value (useful for peer IDs, metadata)
+    pub async fn resolve_txt(&mut self, domain: &str) -> Result<Option<String>> {
+        let records = self.resolve(domain, "TXT").await?;
+        Ok(records.first().map(|r| r.value.clone()))
+    }
+
+    /// Clear the DNS cache
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+    }
+}
+
+impl PeerAuthenticator {
+    /// Resolve a peer's address via NEAR DNS
+    pub async fn resolve_peer_address(&mut self, domain: &str) -> Result<Option<String>> {
+        let mut resolver = NearDnsResolver::new(self.network.clone());
+        resolver.resolve_ip(domain).await
+    }
+
+    /// Get peer metadata from DNS TXT records
+    pub async fn get_peer_metadata(&mut self, domain: &str) -> Result<HashMap<String, String>> {
+        let mut resolver = NearDnsResolver::new(self.network.clone());
+        let records = resolver.resolve(domain, "TXT").await?;
+        
+        let mut metadata = HashMap::new();
+        
+        if let Some(txt) = records.first() {
+            // Parse TXT record like "peer_id=12D3Koo...;version=1.0.0"
+            for pair in txt.value.split(';') {
+                if let Some((key, value)) = pair.split_once('=') {
+                    metadata.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+        }
+        
+        Ok(metadata)
+    }
+
+    /// Discover all gork peers from a DNS contract
+    pub async fn discover_gork_peers(&self, dns_contract: &str) -> Result<Vec<String>> {
+        let resolver = NearDnsResolver::new(self.network.clone());
+        let names = resolver.list_names(dns_contract).await?;
+        
+        // Filter for gork-related names
+        let gork_peers: Vec<String> = names
+            .into_iter()
+            .filter(|n| n.starts_with("gork") || n.starts_with("node"))
+            .map(|n| format!("{}.{}", n, dns_contract.trim_start_matches("dns.")))
+            .collect();
+        
+        info!("Discovered {} gork peers from {}", gork_peers.len(), dns_contract);
+        Ok(gork_peers)
     }
 }
 

@@ -23,6 +23,7 @@ pub mod security;
 pub mod network;
 pub mod relay;
 pub mod auth;
+pub mod dns;
 pub mod skills;
 pub mod load_balancing;
 
