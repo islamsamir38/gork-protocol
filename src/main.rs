@@ -11,6 +11,7 @@ mod near;
 mod network;
 mod registry;
 mod relay;
+mod relay_discovery;
 mod security;
 mod skills;
 mod storage;
@@ -180,6 +181,13 @@ enum Commands {
         /// Bootstrap peers (multiaddresses)
         #[arg(long)]
         bootstrap_peers: Option<String>,
+
+        /// Relay domain for automatic discovery
+        /// 
+        /// Example: --relay relay.jemartel.near
+        /// Queries _p2p.relay.jemartel.near TXT for multiaddr
+        #[arg(long)]
+        relay: Option<String>,
     },
 
     /// Start relay server (help other peers connect)
@@ -365,7 +373,7 @@ async fn run(cli: Cli) -> Result<()> {
             reputation,
             message,
         } => assess_risk(&sender, reputation, &message),
-        Commands::Daemon { port, bootstrap_peers } => start_daemon(port, bootstrap_peers).await,
+        Commands::Daemon { port, bootstrap_peers, relay } => start_daemon(port, bootstrap_peers, relay).await,
         Commands::Relay {
             port,
             max_circuits,
@@ -1005,7 +1013,7 @@ fn assess_risk(sender: &str, reputation: u32, message: &str) -> Result<()> {
     Ok(())
 }
 
-async fn start_daemon(port: u16, bootstrap_peers: Option<String>) -> Result<()> {
+async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<String>) -> Result<()> {
     println!("🚀 Starting Gork Agent P2P Daemon");
     println!();
 
@@ -1023,6 +1031,26 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>) -> Result<()> 
 
     println!("🤖 Agent: {}", config.identity.account_id);
     println!();
+
+    // Resolve relay via DNS discovery if provided
+    let bootstrap_multiaddr = if let Some(relay_domain) = relay {
+        println!("🔍 Discovering relay: {}", relay_domain);
+        
+        let discovery = relay_discovery::RelayDiscovery::new("dns.jemartel.near".to_string());
+        match discovery.discover(&relay_domain).await {
+            Ok(multiaddr) => {
+                println!("✅ Relay discovered: {}", multiaddr);
+                Some(multiaddr)
+            }
+            Err(e) => {
+                println!("❌ Failed to discover relay: {}", e);
+                println!("   Falling back to bootstrap-peers if provided");
+                bootstrap_peers.clone()
+            }
+        }
+    } else {
+        bootstrap_peers.clone()
+    };
 
     // Check if agent is NEAR verified
     if !config.near_verified {

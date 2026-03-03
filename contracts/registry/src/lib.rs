@@ -4,6 +4,9 @@ use borsh::BorshSchema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod trust;
+pub use trust::{TrustConfig, TrustLevel, Endorsement};
+
 /// Storage keys for the contract
 #[derive(BorshSerialize, BorshDeserialize, BorshStorageKey)]
 pub enum StorageKey {
@@ -14,6 +17,8 @@ pub enum StorageKey {
     Skills,
     SkillsByAgent,
     SkillsByTag,
+    Endorsements,
+    EndorsementsByAgent,
 }
 
 /// Agent metadata stored on-chain
@@ -106,6 +111,10 @@ pub struct AgentRegistry {
     skills: UnorderedMap<String, SkillManifest>,
     skills_by_agent: UnorderedMap<AccountId, Vec<String>>,
     skills_by_tag: UnorderedMap<String, Vec<String>>,
+    /// Web of Trust: endorsements received by agent
+    endorsements: UnorderedMap<AccountId, Vec<Endorsement>>,
+    /// Index: endorsements given by agent
+    endorsements_by_agent: UnorderedMap<AccountId, Vec<(AccountId, String)>>,
 }
 
 impl Default for AgentRegistry {
@@ -116,6 +125,8 @@ impl Default for AgentRegistry {
             skills: UnorderedMap::new(StorageKey::Skills),
             skills_by_agent: UnorderedMap::new(StorageKey::SkillsByAgent),
             skills_by_tag: UnorderedMap::new(StorageKey::SkillsByTag),
+            endorsements: UnorderedMap::new(StorageKey::Endorsements),
+            endorsements_by_agent: UnorderedMap::new(StorageKey::EndorsementsByAgent),
         }
     }
 }
@@ -476,5 +487,216 @@ impl AgentRegistry {
         });
 
         skills.into_iter().take(limit).collect()
+    }
+
+    // ==================== WEB OF TRUST FUNCTIONS ====================
+
+    /// Endorse an agent for a specific capability
+    /// This creates a trust relationship in the Web of Trust
+    pub fn endorse_agent(
+        &mut self,
+        endorsed: AccountId,
+        capability: String,
+        trust_level: TrustLevel,
+    ) -> bool {
+        let endorser = env::signer_account_id();
+        require!(endorser != endorsed, "Cannot endorse yourself");
+        require!(self.agents.get(&endorsed).is_some(), "Agent not found");
+        require!(self.agents.get(&endorser).is_some(), "Only registered agents can endorse");
+
+        let endorsement = Endorsement {
+            endorser: endorser.to_string(),
+            endorsed: endorsed.to_string(),
+            capability: capability.clone(),
+            trust_level,
+            timestamp: env::block_timestamp(),
+            revoked: false,
+        };
+
+        // Add to endorsements received
+        let mut received = self.endorsements.get(&endorsed).unwrap_or_default();
+        received.push(endorsement);
+        self.endorsements.insert(&endorsed, &received);
+
+        // Add to endorsements given index
+        let mut given = self.endorsements_by_agent.get(&endorser).unwrap_or_default();
+        given.push((endorsed.clone(), capability.clone()));
+        self.endorsements_by_agent.insert(&endorser, &given);
+
+        near_sdk::log!("Endorsed {} for {} by {}", endorsed, capability, endorser);
+        true
+    }
+
+    /// Revoke an endorsement
+    pub fn revoke_endorsement(
+        &mut self,
+        endorsed: AccountId,
+        capability: String,
+    ) -> bool {
+        let endorser = env::signer_account_id();
+        
+        if let Some(mut endorsements) = self.endorsements.get(&endorsed) {
+            for e in endorsements.iter_mut() {
+                if e.endorser == endorser.to_string() && e.capability == capability && !e.revoked {
+                    e.revoked = true;
+                    self.endorsements.insert(&endorsed, &endorsements);
+                    near_sdk::log!("Revoked endorsement for {}", endorsed);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get all endorsements for an agent
+    pub fn get_endorsements(&self, agent_id: AccountId) -> Vec<Endorsement> {
+        self.endorsements.get(&agent_id).unwrap_or_default()
+    }
+
+    /// Get endorsements given by an agent
+    pub fn get_endorsements_by(&self, endorser: AccountId) -> Vec<(AccountId, String)> {
+        self.endorsements_by_agent.get(&endorser).unwrap_or_default()
+    }
+
+    /// Compute trust score using Web of Trust algorithm
+    /// Takes into account:
+    /// - Endorser's own reputation
+    /// - Trust level (partial vs full)
+    /// - Time decay
+    /// - Transitive trust paths
+    pub fn compute_trust_score(&self, agent_id: AccountId, capability: String) -> u32 {
+        let endorsements = match self.endorsements.get(&agent_id) {
+            Some(e) => e,
+            None => return 50, // Default trust
+        };
+
+        let config = TrustConfig::default();
+        let mut weighted_sum = 0.0;
+        let mut total_weight = 0.0;
+
+        for endorsement in endorsements.iter() {
+            if endorsement.revoked || endorsement.capability != capability {
+                continue;
+            }
+
+            // Get endorser's reputation
+            let endorser_account: AccountId = match endorsement.endorser.parse() {
+                Ok(id) => id,
+                Err(_) => continue, // Skip invalid account IDs
+            };
+            let endorser_trust = match self.agents.get(&endorser_account) {
+                Some(meta) => meta.reputation,
+                None => continue, // Skip unknown endorsers
+            };
+
+            // Skip low-trust endorsers
+            if endorser_trust < config.min_endorser_trust {
+                continue;
+            }
+
+            // Time decay
+            let age_ms = env::block_timestamp() - endorsement.timestamp;
+            let age_days = age_ms / (1000 * 60 * 60 * 24);
+            let decay_factor = if age_days > config.trust_decay_days {
+                0.5
+            } else {
+                1.0
+            };
+
+            // Weight by endorser's trust and trust level
+            let weight = (endorser_trust as f32 / 100.0) 
+                * endorsement.trust_level.weight() 
+                * decay_factor;
+
+            weighted_sum += endorser_trust as f32 * weight;
+            total_weight += weight;
+        }
+
+        if total_weight > 0.0 {
+            (weighted_sum / total_weight).min(100.0) as u32
+        } else {
+            50 // Default for no endorsements
+        }
+    }
+
+    /// Find trust path from one agent to another (for transitive trust)
+    pub fn find_trust_path(
+        &self,
+        source: AccountId,
+        target: AccountId,
+        capability: String,
+        max_depth: Option<u32>,
+    ) -> Option<Vec<AccountId>> {
+        if source == target {
+            return Some(vec![source]);
+        }
+
+        let max_depth = max_depth.unwrap_or(3);
+        let mut visited: Vec<AccountId> = Vec::new();
+        let mut queue = vec![(source.clone(), vec![source.clone()], 0u32)];
+
+        while let Some((current, path, depth)) = queue.pop() {
+            if depth >= max_depth {
+                continue;
+            }
+
+            if let Some(endorsements) = self.endorsements.get(&current) {
+                for e in endorsements.iter() {
+                    if e.revoked || e.capability != capability {
+                        continue;
+                    }
+
+                    // Convert String to AccountId
+                    let endorsed_account: AccountId = match e.endorsed.parse() {
+                        Ok(id) => id,
+                        Err(_) => continue, // Skip invalid account IDs
+                    };
+
+                    if endorsed_account == target {
+                        let mut result = path.clone();
+                        result.push(endorsed_account.clone());
+                        return Some(result);
+                    }
+
+                    if !visited.contains(&endorsed_account) {
+                        visited.push(endorsed_account.clone());
+                        let mut new_path = path.clone();
+                        new_path.push(endorsed_account.clone());
+                        queue.push((endorsed_account.clone(), new_path, depth + 1));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Discover agents by capability with trust filtering
+    /// Returns agents sorted by trust score for the capability
+    pub fn discover_trusted(
+        &self,
+        capability: String,
+        min_trust: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<(AgentMetadata, u32)> {
+        let min_trust = min_trust.unwrap_or(50);
+        let limit = limit.unwrap_or(20) as usize;
+
+        let mut results: Vec<(AgentMetadata, u32)> = self.agents
+            .iter()
+            .filter(|(_, meta)| meta.capabilities.contains(&capability))
+            .map(|(_, meta)| {
+                let trust = self.compute_trust_score(
+                    meta.account_id.parse().unwrap(),
+                    capability.clone()
+                );
+                (meta, trust)
+            })
+            .filter(|(_, trust)| *trust >= min_trust)
+            .collect();
+
+        // Sort by trust score descending
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+        results.into_iter().take(limit).collect()
     }
 }
