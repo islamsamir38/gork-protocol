@@ -14,6 +14,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use regex::Regex;
+use std::path::Path;
+use rocksdb::{DB, Options};
+use tracing::info;
 
 // ============================================================================
 // Layer 1: Rate Limiting
@@ -49,12 +52,47 @@ impl Default for RateLimit {
 
 pub struct RateLimiter {
     limits: HashMap<String, RateLimit>,
+    db: Option<DB>,
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
         Self {
             limits: HashMap::new(),
+            db: None,
+        }
+    }
+
+    /// Enable persistence with RocksDB
+    pub fn with_persistence<P: AsRef<Path>>(mut self, path: P) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        
+        let db = DB::open(&opts, path)?;
+        
+        // Load existing rate limits from DB
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if let Ok(account) = std::str::from_utf8(&key) {
+                if let Ok(limit) = serde_json::from_slice::<RateLimit>(&value) {
+                    self.limits.insert(account.to_string(), limit);
+                }
+            }
+        }
+        
+        self.db = Some(db);
+        info!("Loaded {} rate limits from persistence", self.limits.len());
+        
+        Ok(self)
+    }
+
+    fn persist_limit(&self, account_id: &str, limit: &RateLimit) {
+        if let Some(ref db) = self.db {
+            let key = account_id.as_bytes();
+            if let Ok(value) = serde_json::to_vec(limit) {
+                let _ = db.put(key, value);
+            }
         }
     }
 
@@ -75,6 +113,11 @@ impl RateLimiter {
     pub fn record_message(&mut self, account_id: &str) {
         let limit = self.limits.entry(account_id.to_string()).or_default();
         limit.messages_sent += 1;
+        
+        // Clone limit to avoid borrow issues
+        let limit_clone = limit.clone();
+        let account = account_id.to_string();
+        self.persist_limit(&account, &limit_clone);
     }
 
     pub fn can_call_capability(&mut self, account_id: &str) -> bool {
@@ -92,12 +135,13 @@ impl RateLimiter {
     pub fn record_capability_call(&mut self, account_id: &str) {
         let limit = self.limits.entry(account_id.to_string()).or_default();
         limit.capability_calls += 1;
+        
+        // Clone limit to avoid borrow issues
+        let limit_clone = limit.clone();
+        let account = account_id.to_string();
+        self.persist_limit(&account, &limit_clone);
     }
 }
-
-// ============================================================================
-// Layer 2: Content Filtering
-// ============================================================================
 
 #[derive(Debug, Clone)]
 pub enum ScanResult {
@@ -484,6 +528,8 @@ pub struct AuditEntry {
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
     max_entries: usize,
+    db: Option<DB>,
+    next_id: u64,
 }
 
 impl AuditLog {
@@ -491,6 +537,57 @@ impl AuditLog {
         Self {
             entries: Vec::new(),
             max_entries: 10_000,
+            db: None,
+            next_id: 0,
+        }
+    }
+
+    /// Enable persistence with RocksDB
+    pub fn with_persistence<P: AsRef<Path>>(mut self, path: P) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        
+        let db = DB::open(&opts, path)?;
+        
+        // Load existing audit entries from DB
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        let mut max_id = 0u64;
+        for item in iter {
+            let (key, value) = item?;
+            if let Ok(id_str) = std::str::from_utf8(&key) {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    if let Ok(entry) = serde_json::from_slice::<AuditEntry>(&value) {
+                        self.entries.push(entry);
+                        max_id = max_id.max(id);
+                    }
+                }
+            }
+        }
+        
+        // Sort by timestamp
+        self.entries.sort_by_key(|e| e.timestamp);
+        
+        // Trim to max_entries
+        if self.entries.len() > self.max_entries {
+            self.entries.drain(0..(self.entries.len() - self.max_entries));
+        }
+        
+        self.next_id = max_id + 1;
+        self.db = Some(db);
+        
+        info!("Loaded {} audit entries from persistence", self.entries.len());
+        
+        Ok(self)
+    }
+
+    fn persist_entry(&mut self, entry: &AuditEntry) {
+        if let Some(ref db) = self.db {
+            let key = self.next_id.to_string();
+            self.next_id += 1;
+            
+            if let Ok(value) = serde_json::to_vec(entry) {
+                let _ = db.put(key.as_bytes(), value);
+            }
         }
     }
 
@@ -505,11 +602,22 @@ impl AuditLog {
             details: details.map(|s| s.to_string()),
         };
 
+        self.persist_entry(&entry);
         self.entries.push(entry);
 
         // Trim old entries
         if self.entries.len() > self.max_entries {
             self.entries.remove(0);
+            
+            // Clean up old entries from DB
+            if let Some(ref db) = self.db {
+                // Delete oldest 100 entries
+                let delete_count = 100.min(self.next_id.saturating_sub(self.max_entries as u64));
+                for id in (self.next_id - delete_count)..self.next_id {
+                    let key = id.to_string();
+                    let _ = db.delete(key.as_bytes());
+                }
+            }
         }
     }
 
@@ -524,6 +632,7 @@ impl AuditLog {
             details: None,
         };
 
+        self.persist_entry(&entry);
         self.entries.push(entry);
     }
 
@@ -690,6 +799,21 @@ impl SecurityManager {
             risk_analyzer: RiskAnalyzer::new(),
             owner: owner.to_string(),
         }
+    }
+
+    /// Enable persistence for rate limits and audit logs
+    pub fn with_persistence<P: AsRef<Path>>(self, base_path: P) -> Result<Self> {
+        let base = base_path.as_ref();
+        std::fs::create_dir_all(base)?;
+        
+        let rate_limit_path = base.join("rate_limits");
+        let audit_path = base.join("audit");
+        
+        Ok(Self {
+            rate_limiter: self.rate_limiter.with_persistence(&rate_limit_path)?,
+            audit_log: self.audit_log.with_persistence(&audit_path)?,
+            ..self
+        })
     }
 
     /// Process incoming message through all security layers
