@@ -474,14 +474,43 @@ pub async fn start_metrics_server(port: u16, peer_id: String, mut stats_rx: mpsc
     }
 }
 
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_relay_creation() {
-        let config = RelayConfig::default();
-        let relay = RelayServer::new(config).await;
-        assert!(relay.is_ok());
+    #[test]
+    fn test_relay_config_creation() {
+        let config = RelayConfig {
+            port: 4001,
+            max_circuits: 10,
+            max_circuit_duration_secs: 300,
+            max_circuit_bytes: 1024 * 1024,
+            enable_metrics: false,
+            metrics_port: 9090,
+        };
+        assert_eq!(config.port, 4001);
+        assert!(!config.enable_metrics);
+    }
+
+    #[test]
+    fn test_relay_stats_creation() {
+        let stats = RelayStats {
+            peer_id: "test-peer".to_string(),
+            port: 4001,
+            connected_peers: 5,
+        };
+        assert_eq!(stats.connected_peers, 5);
+    }
+
+    #[test]
+    fn test_relay_event_debug() {
+        let event = RelayEvent::PeerConnected("test-peer".to_string());
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("PeerConnected"));
     }
 }

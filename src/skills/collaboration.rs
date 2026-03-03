@@ -214,3 +214,66 @@ pub enum CollaborationResult {
     Rejected(String),
     Success(TaskResponse),
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trust_level_variants() {
+        let unverified = TrustLevel::Unverified;
+        let high = TrustLevel::High;
+        // Just verify enum exists and can be compared
+        assert!(matches!(unverified, TrustLevel::Unverified));
+        assert!(matches!(high, TrustLevel::High));
+    }
+
+    #[test]
+    fn test_trust_score_creation() {
+        let score = TrustScore {
+            agent_id: "test.near".to_string(),
+            reputation: 85,
+            rating_count: 10,
+            verified: true,
+            capabilities: vec!["compute".to_string()],
+        };
+        assert_eq!(score.agent_id, "test.near");
+        assert_eq!(score.reputation, 85);
+    }
+
+    #[test]
+    fn test_collaboration_manager_new() {
+        let manager = CollaborationManager::new("registry.test.near".to_string(), "testnet".to_string());
+        // Just verify creation works
+        let _ = manager;
+    }
+
+    #[test]
+    fn test_collaboration_result_variants() {
+        let pending = CollaborationResult::Pending("task-1".to_string());
+        let rejected = CollaborationResult::Rejected("Low rep".to_string());
+        
+        assert!(matches!(pending, CollaborationResult::Pending(_)));
+        assert!(matches!(rejected, CollaborationResult::Rejected(_)));
+    }
+
+    #[test]
+    fn test_trustworthy_agent_creation() {
+        let agent = TrustworthyAgent {
+            agent_id: "trusted.near".to_string(),
+            skill_name: "compute".to_string(),
+            trust_score: TrustScore {
+                agent_id: "trusted.near".to_string(),
+                reputation: 90,
+                rating_count: 5,
+                verified: true,
+                capabilities: vec!["compute".to_string()],
+            },
+        };
+        assert_eq!(agent.agent_id, "trusted.near");
+    }
+}

@@ -118,3 +118,64 @@ impl RegistryClient {
         self.view("get_online_count", args).await
     }
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_metadata_creation() {
+        let metadata = AgentMetadata {
+            account_id: "test.near".to_string(),
+            name: "Test Agent".to_string(),
+            capabilities: vec!["compute".to_string(), "storage".to_string()],
+            endpoint: None,
+            public_key: "ed25519:xxx".to_string(),
+            reputation: 50,
+            rating_count: 10,
+            last_seen: 1234567890,
+            description: "Test agent".to_string(),
+            online: true,
+        };
+        assert_eq!(metadata.account_id, "test.near");
+        assert_eq!(metadata.capabilities.len(), 2);
+        assert_eq!(metadata.reputation, 50);
+    }
+
+    #[test]
+    fn test_registry_client_creation() {
+        let client = RegistryClient::new("registry.test.near".to_string(), "testnet");
+        assert_eq!(client.contract_id, "registry.test.near");
+    }
+
+    #[test]
+    fn test_agent_metadata_serialization() {
+        let metadata = AgentMetadata {
+            account_id: "test.near".to_string(),
+            name: "Test".to_string(),
+            capabilities: vec!["test".to_string()],
+            endpoint: None,
+            public_key: "ed25519:test".to_string(),
+            reputation: 75,
+            rating_count: 5,
+            last_seen: 1000,
+            description: "Desc".to_string(),
+            online: false,
+        };
+        
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("test.near"));
+        
+        let decoded: AgentMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.account_id, metadata.account_id);
+    }
+}

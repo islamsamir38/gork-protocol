@@ -134,3 +134,78 @@ impl Default for AgentConfig {
         }
     }
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_identity_creation() {
+        let identity = AgentIdentity::new("test.near".to_string(), vec![1, 2, 3, 4]);
+        assert_eq!(identity.account_id, "test.near");
+        assert_eq!(identity.public_key, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_agent_identity_with_capabilities() {
+        let identity = AgentIdentity::new("test.near".to_string(), vec![])
+            .with_capabilities(vec!["storage".to_string(), "compute".to_string()]);
+        assert_eq!(identity.capabilities.len(), 2);
+    }
+
+    #[test]
+    fn test_capability_request_creation() {
+        let request = CapabilityRequest {
+            request_id: "req-1".to_string(),
+            capability: "hash".to_string(),
+            params: serde_json::json!({"data": "test"}),
+            timeout_ms: 30000,
+            reward: Some("1 NEAR".to_string()),
+        };
+        assert_eq!(request.capability, "hash");
+    }
+
+    #[test]
+    fn test_capability_response_success() {
+        let response = CapabilityResponse {
+            request_id: "req-1".to_string(),
+            result: Ok(serde_json::json!({"hash": "abc123"})),
+            execution_time_ms: 500,
+        };
+        assert!(response.result.is_ok());
+    }
+
+    #[test]
+    fn test_capability_response_error() {
+        let response = CapabilityResponse {
+            request_id: "req-1".to_string(),
+            result: Err("Timeout".to_string()),
+            execution_time_ms: 30000,
+        };
+        assert!(response.result.is_err());
+    }
+
+    #[test]
+    fn test_agent_config_default() {
+        let config = AgentConfig::default();
+        assert_eq!(config.network_id, "testnet");
+        assert!(!config.near_verified);
+    }
+
+    #[test]
+    fn test_message_creation() {
+        let plain = PlainMessage::new("Hello".to_string());
+        assert_eq!(plain.content, "Hello");
+    }
+
+    #[test]
+    fn test_plain_message_bytes() {
+        let plain = PlainMessage::new("Test".to_string());
+        let bytes = plain.to_bytes();
+        assert!(!bytes.is_empty());
+    }
+}

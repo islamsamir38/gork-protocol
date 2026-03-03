@@ -259,3 +259,94 @@ impl From<SkillManifest> for AvailableSkill {
         }
     }
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_task_request_creation() {
+        let request = TaskRequest::with_timeout(
+            "caller.near".to_string(),
+            "compute".to_string(),
+            "hash".to_string(),
+            serde_json::json!({"data": "test"}),
+            30,
+        );
+        assert!(!request.request_id.is_empty());
+        assert_eq!(request.skill_name, "compute");
+    }
+
+    #[test]
+    fn test_task_response_success() {
+        let response = TaskResponse::success(
+            "req-1".to_string(),
+            "executor.near".to_string(),
+            serde_json::json!({"result": 42}),
+            1.23,
+        );
+        assert_eq!(response.request_id, "req-1");
+        assert!(response.success);
+    }
+
+    #[test]
+    fn test_task_response_error() {
+        let response = TaskResponse::error(
+            "req-1".to_string(),
+            "executor.near".to_string(),
+            "Execution failed".to_string(),
+        );
+        assert!(!response.success);
+        assert!(response.error.is_some());
+    }
+
+    #[test]
+    fn test_skill_advertisement_creation() {
+        let ad = SkillAdvertisement {
+            agent_id: "agent.near".to_string(),
+            skill_name: "data-processing".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Process data".to_string(),
+            tags: vec!["data".to_string()],
+            capabilities: vec!["parse".to_string()],
+            requirements: SkillRequirements {
+                timeout_secs: 30,
+                memory_mb: 512,
+            },
+            timestamp: 0,
+        };
+        assert_eq!(ad.skill_name, "data-processing");
+    }
+
+    #[test]
+    fn test_capability_query_creation() {
+        let query = CapabilityQuery {
+            from_agent: "agent.near".to_string(),
+            query: Some("compute".to_string()),
+            tag: Some("ml".to_string()),
+            timestamp: 0,
+        };
+        assert_eq!(query.from_agent, "agent.near");
+    }
+
+    #[test]
+    fn test_available_skill_creation() {
+        let skill = AvailableSkill {
+            name: "image-resize".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Resize images".to_string(),
+            tags: vec!["image".to_string()],
+            capabilities: vec!["resize".to_string()],
+        };
+        assert_eq!(skill.name, "image-resize");
+    }
+}

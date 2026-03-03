@@ -138,3 +138,35 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_skills_error_not_found() {
+        let err = SkillsError::ManifestNotFound("missing".to_string());
+        assert!(format!("{}", err).contains("not found"));
+    }
+
+    #[test]
+    fn test_skills_error_invalid_manifest() {
+        let err = SkillsError::InvalidManifest("bad json".to_string());
+        assert!(format!("{}", err).contains("Invalid manifest"));
+    }
+
+    #[test]
+    fn test_skills_error_package_error() {
+        let err = SkillsError::PackageError("archive error".to_string());
+        assert!(format!("{}", err).contains("package error"));
+    }
+}

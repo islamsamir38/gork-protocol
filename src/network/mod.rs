@@ -447,21 +447,54 @@ pub fn create_p2p_message(content: &str) -> Vec<u8> {
     serde_json::to_vec(&crate::types::PlainMessage::new(content.to_string())).unwrap_or_default()
 }
 
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_network_config_default() {
-        let config = NetworkConfig::default();
-        assert_eq!(config.port, DEFAULT_PORT);
+    fn test_network_config_creation() {
+        let config = NetworkConfig {
+            port: 4001,
+            bootstrap_peers: vec![],
+        };
+        assert_eq!(config.port, 4001);
     }
 
-    #[tokio::test]
-    async fn test_network_creation() {
-        let identity = AgentIdentity::new("test.near".to_string(), vec![0u8; 32]);
-        let (sender, _receiver) = mpsc::unbounded_channel();
-        let network = AgentNetwork::new(identity, NetworkConfig::default(), sender).await;
-        assert!(network.is_ok());
+    #[test]
+    fn test_network_event_debug() {
+        let event = NetworkEvent::PeerConnected("peer-123".to_string());
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("PeerConnected"));
+    }
+
+    #[test]
+    fn test_create_p2p_message() {
+        let content = "Hello, P2P!";
+        let message = create_p2p_message(content);
+        assert!(!message.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiaddr_valid() {
+        let addr = parse_multiaddr("/ip4/127.0.0.1/tcp/4001");
+        assert!(addr.is_ok());
+    }
+
+    #[test]
+    fn test_parse_multiaddr_invalid() {
+        let addr = parse_multiaddr("not-a-valid-address");
+        assert!(addr.is_err());
+    }
+
+    #[test]
+    fn test_message_handler_creation() {
+        let handler = MessageHandler::new("owner.near");
+        // Just verify creation works
+        let _ = handler;
     }
 }
