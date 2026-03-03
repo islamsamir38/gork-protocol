@@ -5,7 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod trust;
+mod registration;
 pub use trust::{TrustConfig, TrustLevel, Endorsement};
+pub use registration::AgentRegistration;
 
 /// Storage keys for the contract
 #[derive(BorshSerialize, BorshDeserialize, BorshStorageKey)]
@@ -19,6 +21,7 @@ pub enum StorageKey {
     SkillsByTag,
     Endorsements,
     EndorsementsByAgent,
+    AgentRegistrations,
 }
 
 /// Agent metadata stored on-chain
@@ -115,6 +118,8 @@ pub struct AgentRegistry {
     endorsements: UnorderedMap<AccountId, Vec<Endorsement>>,
     /// Index: endorsements given by agent
     endorsements_by_agent: UnorderedMap<AccountId, Vec<(AccountId, String)>>,
+    /// Agent registrations (Variant C)
+    agent_registrations: UnorderedMap<AccountId, AgentRegistration>,
 }
 
 impl Default for AgentRegistry {
@@ -127,6 +132,7 @@ impl Default for AgentRegistry {
             skills_by_tag: UnorderedMap::new(StorageKey::SkillsByTag),
             endorsements: UnorderedMap::new(StorageKey::Endorsements),
             endorsements_by_agent: UnorderedMap::new(StorageKey::EndorsementsByAgent),
+            agent_registrations: UnorderedMap::new(StorageKey::AgentRegistrations),
         }
     }
 }
@@ -698,5 +704,45 @@ impl AgentRegistry {
         // Sort by trust score descending
         results.sort_by(|a, b| b.1.cmp(&a.1));
         results.into_iter().take(limit).collect()
+    }
+
+    // ==================== VARIANT C: AGENT REGISTRATION ====================
+
+    /// Register agent's P2P public key on-chain (Variant C)
+    /// This proves ownership of NEAR account and enables certificate-based verification
+    pub fn register_agent_key(&mut self, public_key: Vec<u8>) -> bool {
+        let account_id = env::signer_account_id();
+        
+        let registration = AgentRegistration::new(public_key);
+        self.agent_registrations.insert(&account_id, &registration);
+        
+        near_sdk::log!("Agent key registered for: {}", account_id);
+        true
+    }
+
+    /// Verify agent's P2P public key is registered (on-chain check)
+    pub fn verify_agent_key(&self, account_id: AccountId, public_key: Vec<u8>) -> bool {
+        match self.agent_registrations.get(&account_id) {
+            Some(reg) => reg.public_key == public_key && reg.is_valid(),
+            None => false,
+        }
+    }
+
+    /// Revoke agent registration (can only revoke own key)
+    pub fn revoke_agent_key(&mut self) -> bool {
+        let account_id = env::signer_account_id();
+        
+        match self.agent_registrations.remove(&account_id) {
+            Some(_) => {
+                near_sdk::log!("Agent key revoked for: {}", account_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Get agent registration info
+    pub fn get_agent_registration(&self, account_id: AccountId) -> Option<AgentRegistration> {
+        self.agent_registrations.get(&account_id)
     }
 }

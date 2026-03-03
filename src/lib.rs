@@ -26,6 +26,7 @@ pub mod auth;
 pub mod dns;
 pub mod skills;
 pub mod load_balancing;
+pub mod certificate;
 
 // Re-export load_balancing for convenience
 pub use load_balancing::{P2CSelector, PeerLoad, PeerLoadTracker, RelaySelector, RelayInfo};

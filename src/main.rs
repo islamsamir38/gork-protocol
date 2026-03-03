@@ -17,6 +17,8 @@ mod skills;
 mod storage;
 mod types;
 mod load_balancing;
+mod certificate;
+mod register;
 
 use crate::types::AgentIdentity;
 
@@ -170,6 +172,19 @@ enum Commands {
 
         /// Message content
         message: String,
+    },
+
+    /// Register agent on blockchain (Variant C)
+    /// 
+    /// This creates a cryptographic link between your NEAR account
+    /// and your agent's P2P identity. One-time registration (~0.1 NEAR).
+    /// 
+    /// After registration, your agent can participate in the network
+    /// with certificate-based verification.
+    Register {
+        /// NEAR account to register (must have credentials)
+        #[arg(short, long)]
+        account: String,
     },
 
     /// Start P2P daemon (Phase 3)
@@ -376,6 +391,7 @@ async fn run(cli: Cli) -> Result<()> {
             message,
         } => assess_risk(&sender, reputation, &message),
         Commands::Daemon { port, bootstrap_peers, relay } => start_daemon(port, bootstrap_peers, relay).await,
+        Commands::Register { account } => register::register_agent(&account, &cli.network, &cli.registry).await,
         Commands::Relay {
             port,
             max_circuits,

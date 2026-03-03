@@ -58,6 +58,28 @@ impl AgentStorage {
         }
     }
 
+    /// Save agent certificate
+    pub fn save_certificate(&self, cert: &crate::certificate::AgentCertificate) -> Result<()> {
+        let data = serde_json::to_vec(cert)?;
+        self.db.put(b"certificate", data)?;
+        Ok(())
+    }
+
+    /// Load agent certificate
+    pub fn load_certificate(&self) -> Result<Option<crate::certificate::AgentCertificate>> {
+        match self.db.get(b"certificate")? {
+            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Save agent keypair (encrypted in production)
+    pub fn save_agent_keypair(&self, _crypto: &crate::crypto::MessageCrypto) -> Result<()> {
+        // TODO: Encrypt private key before storing
+        // For now, the keypair is stored in memory only
+        Ok(())
+    }
+
     /// Save message to inbox
     pub fn save_message(&self, message: &Message) -> Result<()> {
         let key = format!("{}{}:{}", keys::INBOX_PREFIX, message.from, message.id);

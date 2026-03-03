@@ -123,7 +123,7 @@ pub struct AgentConfig {
     /// Whether this agent was initialized with NEAR verification
     pub near_verified: bool,
     /// Saved relay domain for auto-discovery (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub saved_relay: Option<String>,
 }
 
