@@ -30,9 +30,10 @@ COPY --from=builder /app/target/release/gork-agent /usr/local/bin/gork-agent
 # Create non-root user
 RUN useradd -m -u 1000 gork
 
-# Initialize agent for relay (dev mode)
+# Initialize agent for relay (dev mode) BEFORE switching to gork user
 RUN gork-agent init --account relay.gork.protocol --dev-mode
 
+# Now switch to gork user
 USER gork
 
 # Expose ports
