@@ -1,6 +1,9 @@
 # Gork Agent Relay
 FROM rust:1.86 as builder
 
+# Force rebuild
+ARG CACHEBUST=1
+
 WORKDIR /app
 
 # Install build dependencies
