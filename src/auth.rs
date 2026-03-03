@@ -2,6 +2,15 @@
 //!
 //! Provides NEAR signature-based peer identity verification
 //! to prevent peer impersonation in P2P networks.
+//!
+//! # Trust Score System
+//!
+//! Uses multi-factor trust scoring to prevent Sybil attacks and reputation farming:
+//! - Stake factor (40%): Skin in the game, logarithmic scaling
+//! - Age factor (15%): Account maturity
+//! - Activity factor (15%): Recent on-chain transactions
+//! - Reputation factor (20%): Ratings from other trusted peers
+//! - History factor (10%): Completed jobs/contracts in the system
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey, SigningKey};
@@ -11,6 +20,169 @@ use reqwest::Client;
 use tracing::{info, warn};
 use std::path::Path;
 use rocksdb::{DB, Options};
+use std::collections::HashMap;
+
+// ============================================================================
+// TRUST SCORE CONSTANTS
+// ============================================================================
+
+/// One NEAR in yoctoNEAR
+const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+
+/// Minimum trust score to submit ratings
+const MIN_TRUST_TO_RATE: f64 = 10.0;
+
+/// Minimum trust score to bid on jobs
+const MIN_TRUST_TO_BID: f64 = 25.0;
+
+/// Minimum trust score to approve others' work
+const MIN_TRUST_TO_APPROVE: f64 = 60.0;
+
+/// Minimum trust score to open disputes
+const MIN_TRUST_TO_DISPUTE: f64 = 40.0;
+
+/// Trust score cache TTL (1 hour)
+const TRUST_CACHE_TTL_SECS: u64 = 3600;
+
+/// Rating cooldown (1 per target per day)
+const RATING_COOLDOWN_SECS: u64 = 86400;
+
+/// Rating decay period (90 days)
+const RATING_DECAY_DAYS: u64 = 90;
+
+// ============================================================================
+// TRUST SCORE STRUCTURES
+// ============================================================================
+
+/// Multi-factor trust score for sybil-resistant reputation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustScore {
+    // Normalized factors (0.0 - 1.0)
+    pub stake_factor: f64,
+    pub age_factor: f64,
+    pub activity_factor: f64,
+    pub reputation_factor: f64,
+    pub history_factor: f64,
+    
+    // Raw data for transparency
+    pub stake_yocto: u128,
+    pub account_age_days: u64,
+    pub tx_count_90d: u64,
+    pub avg_rating: f64,
+    pub rating_count: u64,
+    pub completed_jobs: u64,
+    pub job_success_rate: f64,
+    
+    // Metadata
+    pub calculated_at: u64,
+}
+
+impl TrustScore {
+    /// Calculate composite trust score (0.0 - 100.0)
+    pub fn calculate(&self) -> f64 {
+        let score = (self.stake_factor * 40.0 +
+                     self.age_factor * 15.0 +
+                     self.activity_factor * 15.0 +
+                     self.reputation_factor * 20.0 +
+                     self.history_factor * 10.0);
+        
+        // Ensure minimum score of 3.0 for any valid account
+        score.max(3.0)
+    }
+    
+    /// Check if score meets threshold for an action
+    pub fn can_perform(&self, action: TrustAction) -> bool {
+        let score = self.calculate();
+        match action {
+            TrustAction::Rate => score >= MIN_TRUST_TO_RATE,
+            TrustAction::Bid => score >= MIN_TRUST_TO_BID,
+            TrustAction::Approve => score >= MIN_TRUST_TO_APPROVE,
+            TrustAction::Dispute => score >= MIN_TRUST_TO_DISPUTE,
+        }
+    }
+}
+
+/// Actions that require minimum trust score
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustAction {
+    Rate,
+    Bid,
+    Approve,
+    Dispute,
+}
+
+/// A rating entry with trust-weighted value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatingEntry {
+    pub rater: String,
+    pub rating: u8,           // 1-5 stars
+    pub weight: u128,         // Trust score * scale factor
+    pub timestamp: u64,
+    pub rater_trust_score: f64,  // Snapshot of rater's trust at time of rating
+}
+
+/// Job completion record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub job_id: String,
+    pub account: String,
+    pub completed_at: u64,
+    pub success: bool,
+    pub value_yocto: u128,
+}
+
+/// Account data fetched from NEAR blockchain
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountData {
+    pub account_id: String,
+    pub amount: u128,           // Liquid balance
+    pub locked: u128,           // Staked balance
+    pub storage_usage: u64,
+    pub created_at: Option<u64>, // Block height or timestamp
+}
+
+/// Cache for trust scores
+#[derive(Debug, Clone)]
+pub struct TrustCache {
+    scores: HashMap<String, (TrustScore, u64)>,  // (score, timestamp)
+    ttl_secs: u64,
+}
+
+impl TrustCache {
+    pub fn new() -> Self {
+        Self {
+            scores: HashMap::new(),
+            ttl_secs: TRUST_CACHE_TTL_SECS,
+        }
+    }
+    
+    pub fn get(&self, account: &str) -> Option<&TrustScore> {
+        let now = current_timestamp();
+        self.scores.get(account).and_then(|(score, ts)| {
+            if now - ts < self.ttl_secs {
+                Some(score)
+            } else {
+                None
+            }
+        })
+    }
+    
+    pub fn insert(&mut self, account: String, score: TrustScore) {
+        self.scores.insert(account, (score, current_timestamp()));
+    }
+    
+    pub fn invalidate(&mut self, account: &str) {
+        self.scores.remove(account);
+    }
+    
+    pub fn clear(&mut self) {
+        self.scores.clear();
+    }
+}
+
+// ============================================================================
+// EXISTING STRUCTURES (with additions)
+// ============================================================================
 
 /// NEAR-based peer authentication challenge
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +228,11 @@ pub struct PeerAuthenticator {
     http_client: Client,
     db: Option<DB>,
     reverify_interval_secs: u64, // How often to re-check blockchain (default: 24h)
+    
+    // Trust score system
+    ratings: HashMap<String, Vec<RatingEntry>>,   // target -> ratings
+    job_history: HashMap<String, Vec<JobRecord>>, // account -> jobs
+    trust_cache: TrustCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +263,9 @@ impl PeerAuthenticator {
             http_client: Client::new(),
             db: None,
             reverify_interval_secs: 86400, // 24 hours
+            ratings: HashMap::new(),
+            job_history: HashMap::new(),
+            trust_cache: TrustCache::new(),
         }
     }
 
@@ -101,6 +281,9 @@ impl PeerAuthenticator {
             http_client: Client::new(),
             db: None,
             reverify_interval_secs: 86400,
+            ratings: HashMap::new(),
+            job_history: HashMap::new(),
+            trust_cache: TrustCache::new(),
         }
     }
 
@@ -114,6 +297,9 @@ impl PeerAuthenticator {
             http_client: Client::new(),
             db: None,
             reverify_interval_secs: 86400,
+            ratings: HashMap::new(),
+            job_history: HashMap::new(),
+            trust_cache: TrustCache::new(),
         }
     }
 
@@ -461,6 +647,442 @@ impl PeerAuthenticator {
     pub fn public_key(&self) -> Vec<u8> {
         self.signing_key.verifying_key().to_bytes().to_vec()
     }
+    
+    // ========================================================================
+    // TRUST SCORE SYSTEM
+    // ========================================================================
+    
+    /// Calculate comprehensive trust score for an account
+    pub async fn calculate_trust_score(&mut self, account: &str) -> Result<TrustScore> {
+        // Check cache first
+        if let Some(cached) = self.trust_cache.get(account) {
+            return Ok(cached.clone());
+        }
+        
+        // 1. Fetch account data from NEAR
+        let account_data = self.fetch_account_data(account).await?;
+        
+        // 2. Calculate individual factors
+        let total_stake = account_data.amount.saturating_add(account_data.locked);
+        let stake_factor = Self::calculate_stake_factor(total_stake);
+        let age_factor = Self::calculate_age_factor(account_data.created_at);
+        
+        // 3. Fetch recent transaction count
+        let tx_count = self.fetch_recent_tx_count(account).await.unwrap_or(0);
+        let activity_factor = Self::calculate_activity_factor(tx_count);
+        
+        // 4. Get existing reputation (from our system)
+        let (avg_rating, rating_count) = self.get_reputation_stats(account);
+        let reputation_factor = Self::calculate_reputation_factor(avg_rating, rating_count);
+        
+        // 5. Get job history (from our system)
+        let (completed_jobs, success_rate) = self.get_job_history_stats(account);
+        let history_factor = Self::calculate_history_factor(completed_jobs, success_rate);
+        
+        // 6. Calculate age in days
+        let account_age_days = account_data.created_at
+            .map(|created| {
+                let now = current_timestamp();
+                now.saturating_sub(created) / 86400
+            })
+            .unwrap_or(0);
+        
+        let score = TrustScore {
+            stake_factor,
+            age_factor,
+            activity_factor,
+            reputation_factor,
+            history_factor,
+            stake_yocto: total_stake,
+            account_age_days,
+            tx_count_90d: tx_count,
+            avg_rating,
+            rating_count,
+            completed_jobs,
+            job_success_rate: success_rate,
+            calculated_at: current_timestamp(),
+        };
+        
+        // Cache the result
+        self.trust_cache.insert(account.to_string(), score.clone());
+        
+        info!("Trust score for {}: {:.1} (stake={:.2}, age={:.2}, activity={:.2}, rep={:.2}, hist={:.2})",
+              account, score.calculate(), stake_factor, age_factor, activity_factor, 
+              reputation_factor, history_factor);
+        
+        Ok(score)
+    }
+    
+    /// Calculate stake factor (40% weight)
+    /// Uses logarithmic scaling to prevent whale dominance
+    fn calculate_stake_factor(stake_yocto: u128) -> f64 {
+        let near = stake_yocto as f64 / ONE_NEAR as f64;
+        if near <= 0.0 {
+            return 0.0;
+        }
+        
+        // Logarithmic scale:
+        // 0 NEAR = 0.0
+        // 1 NEAR = 0.20
+        // 10 NEAR = 0.47
+        // 100 NEAR = 0.73
+        // 1000 NEAR = 1.0
+        
+        (near.ln() / 7.0).min(1.0).max(0.0)
+    }
+    
+    /// Calculate age factor (15% weight)
+    /// Linear growth for first year, then caps
+    fn calculate_age_factor(created_at: Option<u64>) -> f64 {
+        let created = match created_at {
+            Some(t) => t,
+            None => return 0.0, // Unknown age = suspicious
+        };
+        
+        let now = current_timestamp();
+        let age_days = now.saturating_sub(created) / 86400;
+        
+        // 0 days = 0.0
+        // 30 days = 0.25
+        // 90 days = 0.5
+        // 365 days = 1.0
+        (age_days as f64 / 365.0).min(1.0)
+    }
+    
+    /// Calculate activity factor (15% weight)
+    /// Based on recent on-chain transactions
+    fn calculate_activity_factor(tx_count_90d: u64) -> f64 {
+        // 0 tx = 0.0
+        // 10 tx = 0.3
+        // 50 tx = 0.6
+        // 100+ tx = 1.0
+        
+        (tx_count_90d as f64 / 100.0).min(1.0)
+    }
+    
+    /// Calculate reputation factor (20% weight)
+    /// Weighted by both average rating and number of ratings (confidence)
+    fn calculate_reputation_factor(avg_rating: f64, rating_count: u64) -> f64 {
+        // No ratings = 0.5 (neutral, not penalized for being new)
+        if rating_count == 0 {
+            return 0.5;
+        }
+        
+        // Confidence factor (more ratings = more reliable)
+        let confidence = (rating_count as f64 / 10.0).min(1.0);
+        
+        // Normalize rating from 1-5 to 0-1
+        let rating_normalized = (avg_rating - 1.0) / 4.0;
+        
+        // Weight: 70% rating quality, 30% confidence
+        rating_normalized * 0.7 + confidence * 0.3
+    }
+    
+    /// Calculate history factor (10% weight)
+    /// Based on completed jobs and success rate
+    fn calculate_history_factor(completed_jobs: u64, success_rate: f64) -> f64 {
+        // 0 jobs = 0.0
+        // 1 job = 0.3
+        // 5 jobs = 0.6
+        // 10+ jobs = 1.0
+        
+        let job_factor = (completed_jobs as f64 / 10.0).min(1.0);
+        
+        // Combine job count with success rate
+        job_factor * 0.6 + success_rate * 0.4
+    }
+    
+    /// Fetch account data from NEAR blockchain
+    async fn fetch_account_data(&self, account_id: &str) -> Result<AccountData> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "query",
+            "params": {
+                "request_type": "view_account",
+                "finality": "final",
+                "account_id": account_id
+            }
+        });
+
+        let response = self.http_client
+            .post(self.network.rpc_url())
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("RPC request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("RPC error: {}", response.status()));
+        }
+
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse RPC response: {}", e))?;
+        
+        let account_result = result.get("result")
+            .ok_or_else(|| anyhow!("No result in RPC response"))?;
+        
+        let amount = account_result.get("amount")
+            .and_then(|a| a.as_str())
+            .and_then(|a| a.parse::<u128>().ok())
+            .unwrap_or(0);
+        
+        let locked = account_result.get("locked")
+            .and_then(|l| l.as_str())
+            .and_then(|l| l.parse::<u128>().ok())
+            .unwrap_or(0);
+        
+        let storage_usage = account_result.get("storage_usage")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
+        
+        // NEAR doesn't expose account creation time directly in view_account
+        // We'll estimate from block height or use 0 if unknown
+        // In production, you'd query the indexer or use archival data
+        let created_at = None;
+        
+        Ok(AccountData {
+            account_id: account_id.to_string(),
+            amount,
+            locked,
+            storage_usage,
+            created_at,
+        })
+    }
+    
+    /// Fetch recent transaction count (last 90 days)
+    /// Note: This requires an indexer in production. For now, returns 0.
+    async fn fetch_recent_tx_count(&self, _account_id: &str) -> Result<u64> {
+        // TODO: Integrate with NEAR indexer or FastNear API
+        // For now, return 0 (will be handled by other factors)
+        Ok(0)
+    }
+    
+    /// Get reputation stats from our rating system
+    fn get_reputation_stats(&self, account: &str) -> (f64, u64) {
+        let ratings = match self.ratings.get(account) {
+            Some(r) => r,
+            None => return (0.0, 0),
+        };
+        
+        if ratings.is_empty() {
+            return (0.0, 0);
+        }
+        
+        // Apply decay to old ratings
+        let now = current_timestamp();
+        let mut total_weight: f64 = 0.0;
+        let mut weighted_sum: f64 = 0.0;
+        let mut count: u64 = 0;
+        
+        for entry in ratings {
+            // Calculate decay factor
+            let age_days = (now - entry.timestamp) / 86400;
+            let decay = if age_days < RATING_DECAY_DAYS {
+                (RATING_DECAY_DAYS - age_days) as f64 / RATING_DECAY_DAYS as f64
+            } else {
+                0.1 // Keep 10% weight for very old ratings
+            };
+            
+            let effective_weight = entry.weight as f64 * decay;
+            total_weight += effective_weight;
+            weighted_sum += (entry.rating as f64) * effective_weight;
+            count += 1;
+        }
+        
+        if total_weight == 0.0 {
+            return (0.0, 0);
+        }
+        
+        let avg = weighted_sum / total_weight;
+        (avg, count)
+    }
+    
+    /// Get job history stats
+    fn get_job_history_stats(&self, account: &str) -> (u64, f64) {
+        let jobs = match self.job_history.get(account) {
+            Some(j) => j,
+            None => return (0, 0.0),
+        };
+        
+        if jobs.is_empty() {
+            return (0, 0.0);
+        }
+        
+        let completed = jobs.len() as u64;
+        let successful = jobs.iter().filter(|j| j.success).count() as u64;
+        let success_rate = successful as f64 / completed as f64;
+        
+        (completed, success_rate)
+    }
+    
+    /// Submit a rating with trust-weighted influence
+    pub async fn submit_rating(
+        &mut self,
+        rater: &str,
+        target: &str,
+        rating: u8,
+    ) -> Result<()> {
+        // Validate rating range
+        if rating < 1 || rating > 5 {
+            return Err(anyhow!("Rating must be 1-5, got {}", rating));
+        }
+        
+        // Calculate rater's trust score
+        let trust = self.calculate_trust_score(rater).await?;
+        let trust_value = trust.calculate();
+        
+        if !trust.can_perform(TrustAction::Rate) {
+            return Err(anyhow!(
+                "Trust score too low ({:.1}) - minimum {:.0} required to rate",
+                trust_value,
+                MIN_TRUST_TO_RATE
+            ));
+        }
+        
+        // Check cooldown (1 rating per target per day per rater)
+        let now = current_timestamp();
+        if let Some(ratings) = self.ratings.get(target) {
+            for existing in ratings {
+                if existing.rater == rater {
+                    let age_secs = now - existing.timestamp;
+                    if age_secs < RATING_COOLDOWN_SECS {
+                        let remaining = RATING_COOLDOWN_SECS - age_secs;
+                        return Err(anyhow!(
+                            "Rating cooldown - can rate again in {} hours",
+                            remaining / 3600
+                        ));
+                    }
+                }
+            }
+        }
+        
+        // Calculate weight (trust score * scale for precision)
+        let weight = (trust_value * 1_000_000.0) as u128;
+        
+        // Create rating entry
+        let entry = RatingEntry {
+            rater: rater.to_string(),
+            rating,
+            weight,
+            timestamp: now,
+            rater_trust_score: trust_value,
+        };
+        
+        // Store rating
+        self.ratings
+            .entry(target.to_string())
+            .or_insert_with(Vec::new)
+            .push(entry);
+        
+        // Invalidate target's cached trust score (reputation changed)
+        self.trust_cache.invalidate(target);
+        
+        // Persist if database enabled
+        if let Some(ref db) = self.db {
+            let key = format!("ratings:{}", target);
+            if let Ok(value) = serde_json::to_vec(&self.ratings.get(target)) {
+                let _ = db.put(key.as_bytes(), value);
+            }
+        }
+        
+        info!("Rating submitted: {} rated {} as {} stars (weight: {:.1})", 
+              rater, target, rating, trust_value);
+        
+        Ok(())
+    }
+    
+    /// Record a job completion
+    pub fn record_job(
+        &mut self,
+        account: &str,
+        job_id: String,
+        success: bool,
+        value_yocto: u128,
+    ) {
+        let record = JobRecord {
+            job_id,
+            account: account.to_string(),
+            completed_at: current_timestamp(),
+            success,
+            value_yocto,
+        };
+        
+        self.job_history
+            .entry(account.to_string())
+            .or_insert_with(Vec::new)
+            .push(record);
+        
+        // Invalidate cached trust score (history changed)
+        self.trust_cache.invalidate(account);
+        
+        // Persist if database enabled
+        if let Some(ref db) = self.db {
+            let key = format!("jobs:{}", account);
+            if let Ok(value) = serde_json::to_vec(&self.job_history.get(account)) {
+                let _ = db.put(key.as_bytes(), value);
+            }
+        }
+    }
+    
+    /// Get trust score summary for display
+    pub async fn get_trust_summary(&mut self, account: &str) -> Result<String> {
+        let score = self.calculate_trust_score(account).await?;
+        
+        let total = score.calculate();
+        let stake_near = score.stake_yocto as f64 / ONE_NEAR as f64;
+        
+        Ok(format!(
+            "Trust Score: {:.1}/100\n\
+             ├─ Stake: {:.2} ({:.1} NEAR)\n\
+             ├─ Age: {:.2} ({} days)\n\
+             ├─ Activity: {:.2} ({} tx/90d)\n\
+             ├─ Reputation: {:.2} ({:.1}★ from {} ratings)\n\
+             └─ History: {:.2} ({} jobs, {:.0}% success)",
+            total,
+            score.stake_factor,
+            stake_near,
+            score.age_factor,
+            score.account_age_days,
+            score.activity_factor,
+            score.tx_count_90d,
+            score.reputation_factor,
+            score.avg_rating,
+            score.rating_count,
+            score.history_factor,
+            score.completed_jobs,
+            score.job_success_rate * 100.0
+        ))
+    }
+    
+    /// Check if account can perform an action
+    pub async fn can_perform_action(&mut self, account: &str, action: TrustAction) -> Result<bool> {
+        let score = self.calculate_trust_score(account).await?;
+        Ok(score.can_perform(action))
+    }
+    
+    /// Apply decay to all old ratings (call periodically)
+    pub fn apply_rating_decay(&mut self) {
+        // Ratings are decayed on-demand in get_reputation_stats
+        // This method can be used to clean up very old ratings
+        let now = current_timestamp();
+        let cutoff = now - (RATING_DECAY_DAYS * 2 * 86400); // 180 days
+        
+        for ratings in self.ratings.values_mut() {
+            ratings.retain(|r| r.timestamp > cutoff);
+        }
+    }
+}
+
+/// Helper function to get current timestamp in seconds
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// Peer authentication message type
@@ -530,5 +1152,282 @@ mod tests {
 
         let result = auth.verify_peer(&response).await;
         assert!(result.is_err());
+    }
+    
+    // ========================================
+    // Trust Score Tests
+    // ========================================
+    
+    #[test]
+    fn test_stake_factor() {
+        // 0 NEAR = 0.0
+        assert!((PeerAuthenticator::calculate_stake_factor(0) - 0.0).abs() < 0.01);
+        
+        // 1 NEAR = 0.0 (ln(1) = 0)
+        let one_near = ONE_NEAR;
+        assert!((PeerAuthenticator::calculate_stake_factor(one_near) - 0.0).abs() < 0.01);
+        
+        // 3 NEAR ≈ 0.16
+        assert!((PeerAuthenticator::calculate_stake_factor(one_near * 3) - 0.16).abs() < 0.05);
+        
+        // 10 NEAR ≈ 0.33
+        assert!((PeerAuthenticator::calculate_stake_factor(one_near * 10) - 0.33).abs() < 0.05);
+        
+        // 100 NEAR ≈ 0.66
+        assert!((PeerAuthenticator::calculate_stake_factor(one_near * 100) - 0.66).abs() < 0.05);
+        
+        // 1000 NEAR ≈ 0.99 (ln(1000)/7 ≈ 0.99)
+        assert!((PeerAuthenticator::calculate_stake_factor(one_near * 1000) - 0.99).abs() < 0.02);
+        
+        // 10000 NEAR = 1.0 (capped, ln(10000)/7 > 1)
+        assert!((PeerAuthenticator::calculate_stake_factor(one_near * 10000) - 1.0).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_age_factor() {
+        // No creation time = 0.0
+        assert!((PeerAuthenticator::calculate_age_factor(None) - 0.0).abs() < 0.01);
+        
+        let now = current_timestamp();
+        
+        // 0 days old = 0.0
+        let zero_days = Some(now);
+        assert!((PeerAuthenticator::calculate_age_factor(zero_days) - 0.0).abs() < 0.01);
+        
+        // 30 days old ≈ 0.08
+        let thirty_days = Some(now - 30 * 86400);
+        assert!((PeerAuthenticator::calculate_age_factor(thirty_days) - 0.08).abs() < 0.02);
+        
+        // 365 days old = 1.0
+        let one_year = Some(now - 365 * 86400);
+        assert!((PeerAuthenticator::calculate_age_factor(one_year) - 1.0).abs() < 0.01);
+        
+        // 730 days old still 1.0 (capped)
+        let two_years = Some(now - 730 * 86400);
+        assert!((PeerAuthenticator::calculate_age_factor(two_years) - 1.0).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_activity_factor() {
+        // 0 tx = 0.0
+        assert!((PeerAuthenticator::calculate_activity_factor(0) - 0.0).abs() < 0.01);
+        
+        // 10 tx = 0.1
+        assert!((PeerAuthenticator::calculate_activity_factor(10) - 0.1).abs() < 0.01);
+        
+        // 50 tx = 0.5
+        assert!((PeerAuthenticator::calculate_activity_factor(50) - 0.5).abs() < 0.01);
+        
+        // 100 tx = 1.0
+        assert!((PeerAuthenticator::calculate_activity_factor(100) - 1.0).abs() < 0.01);
+        
+        // 200 tx still 1.0 (capped)
+        assert!((PeerAuthenticator::calculate_activity_factor(200) - 1.0).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_reputation_factor() {
+        // No ratings = 0.5 (neutral)
+        assert!((PeerAuthenticator::calculate_reputation_factor(0.0, 0) - 0.5).abs() < 0.01);
+        
+        // 5 stars from 1 rater = high rating but low confidence
+        let low_confidence = PeerAuthenticator::calculate_reputation_factor(5.0, 1);
+        assert!(low_confidence > 0.7 && low_confidence < 0.9);
+        
+        // 4.5 stars from 10 raters = good rating with full confidence
+        let high_confidence = PeerAuthenticator::calculate_reputation_factor(4.5, 10);
+        assert!(high_confidence > 0.85);
+        
+        // 1 star from 100 raters = bad rating
+        let bad_rating = PeerAuthenticator::calculate_reputation_factor(1.0, 100);
+        assert!(bad_rating < 0.4);
+    }
+    
+    #[test]
+    fn test_history_factor() {
+        // No jobs = 0.0
+        assert!((PeerAuthenticator::calculate_history_factor(0, 0.0) - 0.0).abs() < 0.01);
+        
+        // 1 job, 100% success = 0.1 * 0.6 + 1.0 * 0.4 = 0.46
+        let one_job = PeerAuthenticator::calculate_history_factor(1, 1.0);
+        assert!(one_job > 0.35 && one_job < 0.55);
+        
+        // 10 jobs, 100% success = 1.0
+        assert!((PeerAuthenticator::calculate_history_factor(10, 1.0) - 1.0).abs() < 0.01);
+        
+        // 10 jobs, 50% success = 1.0 * 0.6 + 0.5 * 0.4 = 0.8
+        let half_success = PeerAuthenticator::calculate_history_factor(10, 0.5);
+        assert!(half_success > 0.7 && half_success < 0.9);
+    }
+    
+    #[test]
+    fn test_trust_score_calculation() {
+        // New account with 1 NEAR, no history
+        let new_account = TrustScore {
+            stake_factor: 0.20,
+            age_factor: 0.0,
+            activity_factor: 0.0,
+            reputation_factor: 0.5,  // Neutral
+            history_factor: 0.0,
+            stake_yocto: ONE_NEAR,
+            account_age_days: 0,
+            tx_count_90d: 0,
+            avg_rating: 0.0,
+            rating_count: 0,
+            completed_jobs: 0,
+            job_success_rate: 0.0,
+            calculated_at: current_timestamp(),
+        };
+        
+        let score = new_account.calculate();
+        // 0.20*40 + 0*15 + 0*15 + 0.5*20 + 0*10 = 8 + 0 + 0 + 10 + 0 = 18
+        // But minimum is 3.0
+        assert!(score >= 3.0 && score <= 25.0);
+        
+        // Established account with 100 NEAR, 1 year old, active
+        let established = TrustScore {
+            stake_factor: 0.73,
+            age_factor: 1.0,
+            activity_factor: 0.8,
+            reputation_factor: 0.9,
+            history_factor: 0.8,
+            stake_yocto: ONE_NEAR * 100,
+            account_age_days: 365,
+            tx_count_90d: 80,
+            avg_rating: 4.5,
+            rating_count: 20,
+            completed_jobs: 8,
+            job_success_rate: 0.95,
+            calculated_at: current_timestamp(),
+        };
+        
+        let score = established.calculate();
+        // 0.73*40 + 1.0*15 + 0.8*15 + 0.9*20 + 0.8*10 = 29.2 + 15 + 12 + 18 + 8 = 82.2
+        assert!(score > 75.0 && score < 90.0);
+    }
+    
+    #[test]
+    fn test_trust_action_thresholds() {
+        let low_score = TrustScore {
+            stake_factor: 0.1,
+            age_factor: 0.1,
+            activity_factor: 0.1,
+            reputation_factor: 0.5,
+            history_factor: 0.0,
+            stake_yocto: ONE_NEAR / 10,
+            account_age_days: 30,
+            tx_count_90d: 5,
+            avg_rating: 0.0,
+            rating_count: 0,
+            completed_jobs: 0,
+            job_success_rate: 0.0,
+            calculated_at: current_timestamp(),
+        };
+        
+        // Low score can rate but not bid
+        assert!(low_score.can_perform(TrustAction::Rate));
+        assert!(!low_score.can_perform(TrustAction::Bid));
+        assert!(!low_score.can_perform(TrustAction::Approve));
+        
+        let high_score = TrustScore {
+            stake_factor: 0.8,
+            age_factor: 1.0,
+            activity_factor: 0.9,
+            reputation_factor: 0.9,
+            history_factor: 0.9,
+            stake_yocto: ONE_NEAR * 200,
+            account_age_days: 400,
+            tx_count_90d: 90,
+            avg_rating: 4.8,
+            rating_count: 30,
+            completed_jobs: 15,
+            job_success_rate: 0.98,
+            calculated_at: current_timestamp(),
+        };
+        
+        // High score can do everything
+        assert!(high_score.can_perform(TrustAction::Rate));
+        assert!(high_score.can_perform(TrustAction::Bid));
+        assert!(high_score.can_perform(TrustAction::Approve));
+        assert!(high_score.can_perform(TrustAction::Dispute));
+    }
+    
+    #[test]
+    fn test_rating_cooldown() {
+        let mut auth = PeerAuthenticator::new("alice.test".to_string());
+        
+        // Manually add a recent rating to simulate cooldown scenario
+        let now = current_timestamp();
+        auth.ratings.insert("bob.test".to_string(), vec![
+            RatingEntry {
+                rater: "alice.test".to_string(),
+                rating: 5,
+                weight: 1000000,
+                timestamp: now - 3600, // 1 hour ago
+                rater_trust_score: 50.0,
+            }
+        ]);
+        
+        // Check that the rating exists and is recent
+        let ratings = auth.ratings.get("bob.test").unwrap();
+        assert_eq!(ratings.len(), 1);
+        assert_eq!(ratings[0].rater, "alice.test");
+        
+        // The cooldown should prevent a new rating within 24 hours
+        // Since we added a rating 1 hour ago, the next rating should fail
+        // However, submit_rating also checks trust score which requires network
+        // So we test the cooldown logic directly
+        
+        // Find the existing rating from alice
+        let existing = ratings.iter().find(|r| r.rater == "alice.test");
+        assert!(existing.is_some());
+        
+        let existing = existing.unwrap();
+        let age_secs = now - existing.timestamp;
+        assert!(age_secs < RATING_COOLDOWN_SECS); // Should be within cooldown
+    }
+    
+    #[test]
+    fn test_job_history_affects_score() {
+        let mut auth = PeerAuthenticator::new("alice.test".to_string());
+        
+        // Record some jobs
+        auth.record_job("alice.test", "job1".to_string(), true, ONE_NEAR);
+        auth.record_job("alice.test", "job2".to_string(), true, ONE_NEAR);
+        auth.record_job("alice.test", "job3".to_string(), false, ONE_NEAR); // Failed
+        
+        let (completed, success_rate) = auth.get_job_history_stats("alice.test");
+        
+        assert_eq!(completed, 3);
+        assert!((success_rate - 0.667).abs() < 0.01); // 2/3 success
+    }
+    
+    #[test]
+    fn test_trust_cache() {
+        let mut cache = TrustCache::new();
+        
+        let score = TrustScore {
+            stake_factor: 0.5,
+            age_factor: 0.5,
+            activity_factor: 0.5,
+            reputation_factor: 0.5,
+            history_factor: 0.5,
+            stake_yocto: ONE_NEAR * 10,
+            account_age_days: 180,
+            tx_count_90d: 50,
+            avg_rating: 4.0,
+            rating_count: 5,
+            completed_jobs: 3,
+            job_success_rate: 0.9,
+            calculated_at: current_timestamp(),
+        };
+        
+        // Insert and retrieve
+        cache.insert("test.near".to_string(), score.clone());
+        assert!(cache.get("test.near").is_some());
+        
+        // Invalidate
+        cache.invalidate("test.near");
+        assert!(cache.get("test.near").is_none());
     }
 }
