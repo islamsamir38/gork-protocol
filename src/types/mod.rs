@@ -122,6 +122,9 @@ pub struct AgentConfig {
     pub network_id: String,
     /// Whether this agent was initialized with NEAR verification
     pub near_verified: bool,
+    /// Saved relay domain for auto-discovery (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_relay: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -131,6 +134,7 @@ impl Default for AgentConfig {
             storage_path: ".gork-agent".to_string(),
             network_id: "testnet".to_string(),
             near_verified: false,
+            saved_relay: None,
         }
     }
 }

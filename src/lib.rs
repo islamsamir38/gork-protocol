@@ -74,6 +74,7 @@ impl Agent {
             storage_path: storage_path.to_string_lossy().to_string(),
             network_id: network.to_string(),
             near_verified: false, // Library API doesn't require NEAR verification
+            saved_relay: None,
         };
 
         storage.save_config(&config)?;

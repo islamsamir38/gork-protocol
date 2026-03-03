@@ -186,6 +186,8 @@ enum Commands {
         /// 
         /// Example: --relay relay.jemartel.near
         /// Queries _p2p.relay.jemartel.near TXT for multiaddr
+        /// 
+        /// If not specified, uses default relay: relay.jemartel.near
         #[arg(long)]
         relay: Option<String>,
     },
@@ -500,6 +502,7 @@ async fn init_agent(
         storage_path: storage_path.to_string_lossy().to_string(),
         network_id: network.to_string(),
         near_verified: !dev_mode, // Verified if not in dev mode
+        saved_relay: None, // Will be set on first daemon run
     };
 
     storage.save_config(&config)?;
@@ -1032,24 +1035,45 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
     println!("🤖 Agent: {}", config.identity.account_id);
     println!();
 
-    // Resolve relay via DNS discovery if provided
-    let bootstrap_multiaddr = if let Some(relay_domain) = relay {
+    // Resolve relay via DNS discovery
+    // Priority: --relay flag > saved relay > default relay
+    const DEFAULT_RELAY: &str = "relay.jemartel.near";
+    
+    let relay_domain = relay.as_ref()
+        .or(config.saved_relay.as_ref())
+        .map(|s| s.as_str())
+        .unwrap_or(DEFAULT_RELAY);
+    
+    let bootstrap_multiaddr = if relay_domain.is_empty() {
+        // No relay, use manual bootstrap peers only
+        bootstrap_peers.clone()
+    } else {
         println!("🔍 Discovering relay: {}", relay_domain);
         
         let discovery = relay_discovery::RelayDiscovery::new("dns.jemartel.near".to_string());
-        match discovery.discover(&relay_domain).await {
+        match discovery.discover(relay_domain).await {
             Ok(multiaddr) => {
                 println!("✅ Relay discovered: {}", multiaddr);
+                
+                // Save for future use
+                // TODO: storage.save_relay(relay_domain)?;
+                
                 Some(multiaddr)
             }
             Err(e) => {
-                println!("❌ Failed to discover relay: {}", e);
-                println!("   Falling back to bootstrap-peers if provided");
-                bootstrap_peers.clone()
+                println!("⚠️  Relay discovery failed: {}", e);
+                
+                if relay.is_some() {
+                    // User explicitly requested this relay, show error
+                    println!("   Falling back to bootstrap-peers if provided");
+                    bootstrap_peers.clone()
+                } else {
+                    // Default relay failed, try to continue anyway
+                    println!("   Continuing without relay (direct connections only)");
+                    bootstrap_peers.clone()
+                }
             }
         }
-    } else {
-        bootstrap_peers.clone()
     };
 
     // Check if agent is NEAR verified
