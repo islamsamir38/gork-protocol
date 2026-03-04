@@ -22,6 +22,62 @@ mod register;
 
 use crate::types::AgentIdentity;
 
+// Rate limiter for API endpoints
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+struct RateLimiter {
+    requests: Arc<std::sync::Mutex<HashMap<String, Vec<Instant>>>>,
+    max_requests: usize,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            max_requests,
+            window,
+        }
+    }
+    
+    fn check(&self, key: &str) -> bool {
+        let mut requests = self.requests.lock().unwrap();
+        let now = Instant::now();
+        
+        let entry = requests.entry(key.to_string()).or_insert_with(Vec::new);
+        entry.retain(|&time| now.duration_since(time) < self.window);
+        
+        if entry.len() < self.max_requests {
+            entry.push(now);
+            true
+        } else {
+            false
+        }
+    }
+    
+    fn remaining(&self, key: &str) -> usize {
+        let requests = self.requests.lock().unwrap();
+        let now = Instant::now();
+        
+        if let Some(entry) = requests.get(key) {
+            let count = entry.iter().filter(|&&time| now.duration_since(time) < self.window).count();
+            self.max_requests.saturating_sub(count)
+        } else {
+            self.max_requests
+        }
+    }
+}
+
+// Rate limit error
+#[derive(Debug)]
+struct RateLimitError {
+    retry_after: u64,
+}
+
+impl warp::reject::Reject for RateLimitError {}
+
 /// Default registry contract ID
 const DEFAULT_REGISTRY: &str = "registry.gork-agent.testnet";
 
@@ -498,8 +554,41 @@ fn create_api_routes(
     let connected_peers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let connected_peers_peers = connected_peers.clone();
     
-    // GET /health - Health check
-    let health = warp::path("health")
+    // Rate limiters (different limits for different endpoints)
+    let rate_limiter_general = Arc::new(RateLimiter::new(100, Duration::from_secs(60))); // 100 req/min
+    let rate_limiter_send = Arc::new(RateLimiter::new(30, Duration::from_secs(60))); // 30 req/min for send
+    let rate_limiter_ws = Arc::new(RateLimiter::new(10, Duration::from_secs(60))); // 10 conn/min for WS
+    
+    // Clone storage paths for different routes
+    let storage_path_status = Arc::new(storage_path.clone());
+    let storage_path_inbox = Arc::new(storage_path.clone());
+    let storage_path_send = Arc::new(storage_path.clone());
+    let ws_broadcast_send = ws_broadcast.clone();
+    
+    // Rate limiting middleware
+    let with_rate_limit = |limiter: Arc<RateLimiter>| {
+        warp::any()
+            .map(move || limiter.clone())
+            .and(warp::addr::remote())
+            .and_then(move |limiter: Arc<RateLimiter>, addr: Option<std::net::SocketAddr>| {
+                async move {
+                    let ip = addr
+                        .map(|a| a.ip().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    
+                    if limiter.check(&ip) {
+                        Ok((limiter, ip))
+                    } else {
+                        Err(warp::reject::custom(RateLimitError {
+                            retry_after: limiter.window.as_secs(),
+                        }))
+                    }
+                }
+            })
+    };
+    
+    // GET /health - Health check (no rate limit for monitoring)
+    let health_limited = warp::path("health")
         .map(move || {
             warp::reply::json(&serde_json::json!({
                 "status": "ok",
@@ -508,114 +597,123 @@ fn create_api_routes(
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }))
         });
+
+    // Apply rate limiting to routes
+    let limiter_general = rate_limiter_general.clone();
+    let limiter_send = rate_limiter_send.clone();
+    let limiter_ws = rate_limiter_ws.clone();
     
-    // GET /api/v1/status - Daemon status
-    let status = warp::path!("api" / "v1" / "status")
-        .map(move || {
-            warp::reply::json(&serde_json::json!({
-                "account": account_id_status.clone(),
-                "peer_id": peer_id_status.clone(),
-                "storage": storage_path_status.to_str().unwrap_or("unknown"),
-            }))
+    // Status endpoint - general rate limit
+    let status_limited = warp::any()
+        .and(with_rate_limit(limiter_general.clone()))
+        .and_then(move |(_, ip)| {
+            let account_id_status = account_id.clone();
+            let peer_id_status = peer_id.clone();
+            let storage_path_status = storage_path_status.clone();
+            async move {
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "account": account_id_status.clone(),
+                    "peer_id": peer_id_status.clone(),
+                    "storage": storage_path_status.to_str().unwrap_or("unknown"),
+                })))
+            }
         });
     
-    // GET /api/v1/peers - Connection status
-    let peers = warp::path!("api" / "v1" / "peers")
-        .map(move || {
-            let count = connected_peers_peers.load(std::sync::atomic::Ordering::Relaxed);
-            warp::reply::json(&serde_json::json!({
-                "connected_peers": count,
-                "mesh_ready": count > 0,
-                "status": if count > 0 { "connected" } else { "isolated" },
-            }))
+    // Peers endpoint - general rate limit
+    let peers_limited = warp::any()
+        .and(with_rate_limit(limiter_general.clone()))
+        .and_then(move |(_, _)| {
+            let connected_peers_peers = connected_peers.clone();
+            async move {
+                let count = connected_peers_peers.load(std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "connected_peers": count,
+                    "mesh_ready": count > 0,
+                    "status": if count > 0 { "connected" } else { "isolated" },
+                })))
+            }
         });
     
-    // GET /api/v1/inbox - Get messages
-    let inbox = warp::path!("api" / "v1" / "inbox")
-        .and(warp::get())
-        .map(move || {
-            match storage::AgentStorage::open(&storage_path_inbox) {
-                Ok(storage) => {
-                    match storage.get_messages() {
-                        Ok(messages) => {
-                            warp::reply::json(&serde_json::json!({
-                                "count": messages.len(),
-                                "messages": messages,
-                            }))
-                        }
-                        Err(e) => {
-                            warp::reply::json(&serde_json::json!({
-                                "error": e.to_string(),
-                            }))
+    // Inbox endpoint - general rate limit
+    let inbox_limited = warp::any()
+        .and(with_rate_limit(limiter_general.clone()))
+        .and_then(move |(_, _)| {
+            let storage_path_inbox = storage_path_inbox.clone();
+            async move {
+                match storage::AgentStorage::open(storage_path_inbox.as_ref()) {
+                    Ok(storage) => {
+                        match storage.get_messages() {
+                            Ok(messages) => {
+                                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                    "messages": messages,
+                                    "count": messages.len(),
+                                })))
+                            }
+                            Err(e) => {
+                                Ok(warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string(),
+                                })))
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    warp::reply::json(&serde_json::json!({
-                        "error": e.to_string(),
-                    }))
+                    Err(e) => {
+                        Ok(warp::reply::json(&serde_json::json!({
+                            "error": e.to_string(),
+                        })))
+                    }
                 }
             }
         });
     
-    // POST /api/v1/send - Queue message for sending
-    let send = warp::path!("api" / "v1" / "send")
-        .and(warp::post())
+    // Send endpoint - stricter rate limit
+    let send_limited = warp::any()
+        .and(with_rate_limit(limiter_send))
         .and(warp::body::json())
-        .map(move |body: serde_json::Value| {
-            let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            
-            // Queue message in database
-            match storage::AgentStorage::open(&storage_path_send) {
-                Ok(storage) => {
-                    match storage.queue_message(to, message) {
-                        Ok(id) => {
-                            warp::reply::json(&serde_json::json!({
-                                "status": "queued",
-                                "id": id,
-                                "to": to,
-                                "message": "Message queued for sending when P2P connection available",
-                            }))
-                        }
-                        Err(e) => {
-                            warp::reply::json(&serde_json::json!({
-                                "error": e.to_string(),
-                            }))
+        .and_then(move |(_, _), body: serde_json::Value| {
+            let storage_path_send = storage_path_send.clone();
+            async move {
+                let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                
+                match storage::AgentStorage::open(storage_path_send.as_ref()) {
+                    Ok(storage) => {
+                        match storage.queue_message(to, message) {
+                            Ok(id) => {
+                                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                    "status": "queued",
+                                    "id": id,
+                                    "to": to,
+                                    "message": "Message queued for sending when P2P connection available",
+                                })))
+                            }
+                            Err(e) => {
+                                Ok(warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string(),
+                                })))
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    warp::reply::json(&serde_json::json!({
-                        "error": e.to_string(),
-                    }))
+                    Err(e) => {
+                        Ok(warp::reply::json(&serde_json::json!({
+                            "error": e.to_string(),
+                        })))
+                    }
                 }
             }
         });
     
-    // WebSocket endpoint for real-time inbox updates
-    let ws_inbox = warp::path!("api" / "v1" / "ws")
+    // WebSocket endpoint - connection rate limit
+    let ws_limited = warp::any()
+        .and(with_rate_limit(limiter_ws))
         .and(warp::ws())
-        .map(move |ws: warp::ws::Ws| {
-            let bcast = ws_broadcast.clone();
+        .map(move |(_, _), ws: warp::ws::Ws| {
+            let bcast = ws_broadcast_send.clone();
             ws.on_upgrade(|websocket| async move {
-                use futures_util::SinkExt;
-                
                 let mut recv = bcast.subscribe();
                 
-                // Send initial connection message
-                let connected_msg = serde_json::json!({
-                    "type": "connected",
-                    "message": "WebSocket connected - real-time updates enabled"
-                }).to_string();
-                
-                // For simplicity, we just maintain the connection
-                // In production, would need to properly handle WebSocket send/recv
                 loop {
                     match recv.recv().await {
                         Ok(text) => {
-                            // In full implementation, would send via websocket.send()
-                            // For now, just log
                             println!("📢 Broadcasting to WebSocket: {}", text);
                         }
                         Err(_) => break,
@@ -624,12 +722,27 @@ fn create_api_routes(
             })
         });
     
-    health
-        .or(status)
-        .or(peers)
-        .or(inbox)
-        .or(send)
-        .or(ws_inbox)
+    // Combine all routes with rate limiting
+    health_limited
+        .or(status_limited)
+        .or(peers_limited)
+        .or(inbox_limited)
+        .or(send_limited)
+        .or(ws_limited)
+        .recover(|rejection: warp::Rejection| async move {
+            if let Some(err) = rejection.find::<RateLimitError>() {
+                Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "error": "rate_limit_exceeded",
+                        "message": format!("Too many requests. Retry after {} seconds", err.retry_after),
+                        "retry_after": err.retry_after,
+                    })),
+                    warp::http::StatusCode::TOO_MANY_REQUESTS,
+                ))
+            } else {
+                Err(rejection)
+            }
+        })
 }
 
 async fn init_agent(
