@@ -78,6 +78,12 @@ struct RateLimitError {
 
 impl warp::reject::Reject for RateLimitError {}
 
+// Authentication error
+#[derive(Debug)]
+struct AuthError;
+
+impl warp::reject::Reject for AuthError {}
+
 /// Default registry contract ID
 const DEFAULT_REGISTRY: &str = "registry.gork-agent.testnet";
 
@@ -539,6 +545,33 @@ fn create_api_routes(
 ) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     use warp::Filter;
     
+    // Load internal API key
+    let internal_key = storage::AgentStorage::open(&storage_path)
+        .ok()
+        .and_then(|s| s.get("internal_api_key").ok())
+        .flatten()
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default();
+    
+    let require_auth = !internal_key.is_empty();
+    
+    // Authentication middleware
+    let with_auth = warp::header::optional::<String>("X-API-Key")
+        .and_then(move |api_key: Option<String>| {
+            let internal_key = internal_key.clone();
+            async move {
+                if !require_auth {
+                    // No internal key set, allow all requests
+                    return Ok(());
+                }
+                
+                match api_key {
+                    Some(key) if key == internal_key => Ok(()),
+                    _ => Err(warp::reject::custom(AuthError)),
+                }
+            }
+        });
+    
     // Clone values for use in closures
     let account_id_health = account_id.clone();
     let peer_id_health = peer_id.clone();
@@ -603,10 +636,14 @@ fn create_api_routes(
     let limiter_send = rate_limiter_send.clone();
     let limiter_ws = rate_limiter_ws.clone();
     
-    // Status endpoint - general rate limit
-    let status_limited = warp::any()
+    // Status endpoint - general rate limit + auth
+    let status_limited = warp::path("api")
+        .and(warp::path("v1"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
         .and(with_rate_limit(limiter_general.clone()))
-        .and_then(move |(_, ip)| {
+        .and(with_auth.clone())
+        .and_then(move |(_, ip), _| {
             let account_id_status = account_id.clone();
             let peer_id_status = peer_id.clone();
             let storage_path_status = storage_path_status.clone();
@@ -619,10 +656,14 @@ fn create_api_routes(
             }
         });
     
-    // Peers endpoint - general rate limit
-    let peers_limited = warp::any()
+    // Peers endpoint - general rate limit + auth
+    let peers_limited = warp::path("api")
+        .and(warp::path("v1"))
+        .and(warp::path("peers"))
+        .and(warp::path::end())
         .and(with_rate_limit(limiter_general.clone()))
-        .and_then(move |(_, _)| {
+        .and(with_auth.clone())
+        .and_then(move |(_, _), _| {
             let connected_peers_peers = connected_peers.clone();
             async move {
                 let count = connected_peers_peers.load(std::sync::atomic::Ordering::Relaxed);
@@ -634,10 +675,14 @@ fn create_api_routes(
             }
         });
     
-    // Inbox endpoint - general rate limit
-    let inbox_limited = warp::any()
+    // Inbox endpoint - general rate limit + auth
+    let inbox_limited = warp::path("api")
+        .and(warp::path("v1"))
+        .and(warp::path("inbox"))
+        .and(warp::path::end())
         .and(with_rate_limit(limiter_general.clone()))
-        .and_then(move |(_, _)| {
+        .and(with_auth.clone())
+        .and_then(move |(_, _), _| {
             let storage_path_inbox = storage_path_inbox.clone();
             async move {
                 match storage::AgentStorage::open(storage_path_inbox.as_ref()) {
@@ -665,11 +710,15 @@ fn create_api_routes(
             }
         });
     
-    // Send endpoint - stricter rate limit
-    let send_limited = warp::any()
+    // Send endpoint - stricter rate limit + auth
+    let send_limited = warp::path("api")
+        .and(warp::path("v1"))
+        .and(warp::path("send"))
+        .and(warp::path::end())
         .and(with_rate_limit(limiter_send))
+        .and(with_auth.clone())
         .and(warp::body::json())
-        .and_then(move |(_, _), body: serde_json::Value| {
+        .and_then(move |(_, _), _, body: serde_json::Value| {
             let storage_path_send = storage_path_send.clone();
             async move {
                 let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -702,11 +751,15 @@ fn create_api_routes(
             }
         });
     
-    // WebSocket endpoint - connection rate limit
-    let ws_limited = warp::any()
+    // WebSocket endpoint - connection rate limit + auth
+    let ws_limited = warp::path("api")
+        .and(warp::path("v1"))
+        .and(warp::path("ws"))
+        .and(warp::path::end())
         .and(with_rate_limit(limiter_ws))
+        .and(with_auth.clone())
         .and(warp::ws())
-        .map(move |(_, _), ws: warp::ws::Ws| {
+        .map(move |(_, _), _, ws: warp::ws::Ws| {
             let bcast = ws_broadcast_send.clone();
             ws.on_upgrade(|websocket| async move {
                 let mut recv = bcast.subscribe();
@@ -723,6 +776,7 @@ fn create_api_routes(
         });
     
     // Combine all routes with rate limiting
+    // Note: Auth is checked via X-API-Key header in each endpoint
     health_limited
         .or(status_limited)
         .or(peers_limited)
@@ -738,6 +792,14 @@ fn create_api_routes(
                         "retry_after": err.retry_after,
                     })),
                     warp::http::StatusCode::TOO_MANY_REQUESTS,
+                ))
+            } else if rejection.find::<AuthError>().is_some() {
+                Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "error": "unauthorized",
+                        "message": "Missing or invalid X-API-Key header",
+                    })),
+                    warp::http::StatusCode::UNAUTHORIZED,
                 ))
             } else {
                 Err(rejection)
