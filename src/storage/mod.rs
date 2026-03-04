@@ -300,6 +300,52 @@ impl AgentStorage {
             Err(e) => Err(e.into()),
         }
     }
+    
+    // ========================================================================
+    // Database Cleanup
+    // ========================================================================
+    
+    /// Cleanup old messages based on retention period
+    pub fn cleanup_old_messages(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - (days * 86400);
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM messages WHERE timestamp < ?1",
+            params![cutoff]
+        )?;
+        Ok(rows)
+    }
+    
+    /// Cleanup sent queue messages
+    pub fn cleanup_sent_queue(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM message_queue WHERE status = 'sent'",
+            []
+        )?;
+        Ok(rows)
+    }
+    
+    /// Cleanup failed queue messages (after max attempts)
+    pub fn cleanup_failed_queue(&self, max_attempts: i32) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM message_queue WHERE status = 'failed' AND attempts >= ?1",
+            params![max_attempts]
+        )?;
+        Ok(rows)
+    }
+    
+    /// Cleanup unused API keys (not used in X days)
+    pub fn cleanup_unused_api_keys(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - (days * 86400);
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM api_keys WHERE name != 'internal' AND (last_used IS NULL OR last_used < ?1)",
+            params![cutoff]
+        )?;
+        Ok(rows)
+    }
 
     /// Store generic key-value
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {
