@@ -14,6 +14,9 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# HTTP API for daemon
+warp = "0.3"
+
 # P2P networking
 libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "relay", "macros", "tokio", "autonat", "dcutr", "rendezvous"] }
 

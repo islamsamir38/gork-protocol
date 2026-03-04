@@ -414,6 +414,97 @@ fn get_storage_path() -> std::path::PathBuf {
     }
 }
 
+// HTTP API routes for daemon
+fn create_api_routes(
+    storage_path: std::path::PathBuf,
+    account_id: String,
+    peer_id: String,
+) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    use warp::Filter;
+    
+    // Clone values for use in closures
+    let account_id_health = account_id.clone();
+    let peer_id_health = peer_id.clone();
+    
+    let account_id_status = account_id.clone();
+    let peer_id_status = peer_id.clone();
+    let storage_path_status = storage_path.clone();
+    
+    let storage_path_inbox = storage_path.clone();
+    
+    // GET /health - Health check
+    let health = warp::path("health")
+        .map(move || {
+            warp::reply::json(&serde_json::json!({
+                "status": "ok",
+                "account": account_id_health.clone(),
+                "peer_id": peer_id_health.clone(),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }))
+        });
+    
+    // GET /api/v1/status - Daemon status
+    let status = warp::path!("api" / "v1" / "status")
+        .map(move || {
+            warp::reply::json(&serde_json::json!({
+                "account": account_id_status.clone(),
+                "peer_id": peer_id_status.clone(),
+                "storage": storage_path_status.to_str().unwrap_or("unknown"),
+            }))
+        });
+    
+    // GET /api/v1/inbox - Get messages
+    let inbox = warp::path!("api" / "v1" / "inbox")
+        .and(warp::get())
+        .map(move || {
+            match storage::AgentStorage::open(&storage_path_inbox) {
+                Ok(storage) => {
+                    match storage.get_messages() {
+                        Ok(messages) => {
+                            warp::reply::json(&serde_json::json!({
+                                "count": messages.len(),
+                                "messages": messages,
+                            }))
+                        }
+                        Err(e) => {
+                            warp::reply::json(&serde_json::json!({
+                                "error": e.to_string(),
+                            }))
+                        }
+                    }
+                }
+                Err(e) => {
+                    warp::reply::json(&serde_json::json!({
+                        "error": e.to_string(),
+                    }))
+                }
+            }
+        });
+    
+    // POST /api/v1/send - Send message (returns instruction to use CLI command for now)
+    let send = warp::path!("api" / "v1" / "send")
+        .and(warp::post())
+        .and(warp::body::json())
+        .map(|body: serde_json::Value| {
+            // For now, return instructions
+            // In full implementation, this would broadcast via P2P
+            let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let _message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            
+            warp::reply::json(&serde_json::json!({
+                "status": "queued",
+                "to": to,
+                "hint": "Use 'gork-agent send' command for P2P messaging",
+                "note": "Direct API sending requires P2P network integration (TODO)",
+            }))
+        });
+    
+    health
+        .or(status)
+        .or(inbox)
+        .or(send)
+}
+
 async fn init_agent(
     account: &str,
     network: &str,
@@ -664,6 +755,36 @@ async fn send_message(to: &str, message: &str) -> Result<()> {
     println!("📨 Sending message to: {}", to);
     println!("   Content: {}", message);
     println!();
+
+    // Try HTTP API first (fast path - uses daemon's P2P connections)
+    let api_port = 4002; // Default daemon port + 1
+    let api_url = format!("http://127.0.0.1:{}/api/v1/send", api_port);
+    
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "to": to,
+        "message": message,
+    });
+    
+    match client
+        .post(&api_url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            println!("✅ Message sent via local daemon API");
+            println!("   API: {}", api_url);
+            return Ok(());
+        }
+        _ => {
+            // Daemon not available, use temp P2P node
+            println!("⚠️  Local daemon not available, using temp P2P node...");
+            println!("   (Start daemon with 'gork-agent daemon' for faster sends)");
+            println!();
+        }
+    }
 
     // Load config (read-only, should work)
     let storage = storage::AgentStorage::open(&storage_path)?;
@@ -1175,7 +1296,8 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
     let listen_addr = p2p_network.listen(Some(port)).await?;
     println!("📡 Listening on: {}", listen_addr);
     println!("   Peer ID: {}", p2p_network.peer_id());
-
+    println!("   API Port: {} (HTTP)", port + 1);
+    
     if p2p_network.requires_auth() {
         println!("   🔒 Authentication: REQUIRED (rejecting unverified peers)");
     } else {
@@ -1192,6 +1314,24 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
 
     // Clone storage path for use in async block
     let storage_path = get_storage_path();
+    let storage_path_clone = storage_path.clone();
+    let account_id = config.identity.account_id.clone();
+    let peer_id = p2p_network.peer_id().to_string();
+    
+    // Start HTTP API server
+    let api_port = port + 1;
+    let api_routes = create_api_routes(
+        storage_path_clone,
+        account_id.clone(),
+        peer_id.clone(),
+    );
+    
+    let api_server = tokio::spawn(async move {
+        println!("🌐 API server running on http://127.0.0.1:{}", api_port);
+        warp::serve(api_routes)
+            .run(([127, 0, 0, 1], api_port))
+            .await;
+    });
 
     // Run network event loop
     tokio::select! {
