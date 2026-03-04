@@ -43,7 +43,9 @@ impl AgentStorage {
                 ciphertext BLOB,
                 nonce BLOB,
                 signature BLOB,
-                sender_pubkey BLOB
+                sender_pubkey BLOB,
+                delivered_at INTEGER,
+                delivery_status TEXT DEFAULT 'pending'
             );
             
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
@@ -264,6 +266,39 @@ impl AgentStorage {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages", [])?;
         Ok(())
+    }
+    
+    /// Mark message as delivered
+    pub fn mark_delivered(&self, message_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "UPDATE messages SET delivered_at = ?1, delivery_status = 'delivered' WHERE id = ?2",
+            params![now, message_id],
+        )?;
+        Ok(())
+    }
+    
+    /// Get delivery status for message
+    pub fn get_delivery_status(&self, message_id: &str) -> Result<Option<(i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT delivered_at, delivery_status FROM messages WHERE id = ?1"
+        )?;
+        let result = stmt.query_row(params![message_id], |row| {
+            let delivered_at: i64 = row.get(0)?;
+            let status: String = row.get(1)?;
+            Ok((delivered_at, status))
+        });
+        
+        match result {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Store generic key-value

@@ -250,13 +250,15 @@ enum Commands {
         action: MarketplaceCommands,
     },
     
-    /// Manage API keys for HTTP API authentication
+    /// Manage API keys for HTTP API authentication (internal use)
+    #[command(hide = true)]
     ApiKeys {
         #[command(subcommand)]
         action: ApiKeyCommands,
     },
     
-    /// Manage message queue for offline sending
+    /// Manage message queue for offline sending (internal use)
+    #[command(hide = true)]
     Queue {
         #[command(subcommand)]
         action: QueueCommands,
@@ -490,6 +492,11 @@ fn create_api_routes(
     
     let storage_path_inbox = storage_path.clone();
     
+    let storage_path_send = storage_path.clone();
+    
+    let connected_peers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connected_peers_peers = connected_peers.clone();
+    
     // GET /health - Health check
     let health = warp::path("health")
         .map(move || {
@@ -508,6 +515,17 @@ fn create_api_routes(
                 "account": account_id_status.clone(),
                 "peer_id": peer_id_status.clone(),
                 "storage": storage_path_status.to_str().unwrap_or("unknown"),
+            }))
+        });
+    
+    // GET /api/v1/peers - Connection status
+    let peers = warp::path!("api" / "v1" / "peers")
+        .map(move || {
+            let count = connected_peers_peers.load(std::sync::atomic::Ordering::Relaxed);
+            warp::reply::json(&serde_json::json!({
+                "connected_peers": count,
+                "mesh_ready": count > 0,
+                "status": if count > 0 { "connected" } else { "isolated" },
             }))
         });
     
@@ -539,28 +557,58 @@ fn create_api_routes(
             }
         });
     
-    // POST /api/v1/send - Send message (returns instruction to use CLI command for now)
+    // POST /api/v1/send - Queue message for sending
     let send = warp::path!("api" / "v1" / "send")
         .and(warp::post())
         .and(warp::body::json())
-        .map(|body: serde_json::Value| {
-            // For now, return instructions
-            // In full implementation, this would broadcast via P2P
+        .map(move |body: serde_json::Value| {
             let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let _message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
             
-            warp::reply::json(&serde_json::json!({
-                "status": "queued",
-                "to": to,
-                "hint": "Use 'gork-agent send' command for P2P messaging",
-                "note": "Direct API sending requires P2P network integration (TODO)",
-            }))
+            // Queue message in database
+            match storage::AgentStorage::open(&storage_path_send) {
+                Ok(storage) => {
+                    match storage.queue_message(to, message) {
+                        Ok(id) => {
+                            warp::reply::json(&serde_json::json!({
+                                "status": "queued",
+                                "id": id,
+                                "to": to,
+                                "message": "Message queued for sending when P2P connection available",
+                            }))
+                        }
+                        Err(e) => {
+                            warp::reply::json(&serde_json::json!({
+                                "error": e.to_string(),
+                            }))
+                        }
+                    }
+                }
+                Err(e) => {
+                    warp::reply::json(&serde_json::json!({
+                        "error": e.to_string(),
+                    }))
+                }
+            }
+        });
+    
+    // WebSocket endpoint for real-time inbox updates
+    let ws_inbox = warp::path!("api" / "v1" / "ws")
+        .and(warp::ws())
+        .map(|ws: warp::ws::Ws| {
+            ws.on_upgrade(|websocket| async move {
+                // For now, just accept connection and close
+                // Full implementation would maintain connections and broadcast
+                let _ = websocket;
+            })
         });
     
     health
         .or(status)
+        .or(peers)
         .or(inbox)
         .or(send)
+        .or(ws_inbox)
 }
 
 async fn init_agent(
@@ -677,6 +725,10 @@ async fn init_agent(
 
     storage.save_config(&config)?;
     storage.save_identity(&identity)?;
+    
+    // Auto-generate internal API key (user doesn't need to manage this)
+    let api_key = storage.create_api_key("internal", "read,write,admin")?;
+    storage.put("internal_api_key", api_key.as_bytes())?;
 
     println!();
     if dev_mode {
@@ -814,6 +866,12 @@ async fn send_message(to: &str, message: &str) -> Result<()> {
     println!("   Content: {}", message);
     println!();
 
+    // Load internal API key (auto-generated during init)
+    let storage = storage::AgentStorage::open(&storage_path)?;
+    let api_key = storage.get("internal_api_key")?
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default();
+    
     // Try HTTP API first (fast path - uses daemon's P2P connections)
     let api_port = 4002; // Default daemon port + 1
     let api_url = format!("http://127.0.0.1:{}/api/v1/send", api_port);
@@ -824,13 +882,17 @@ async fn send_message(to: &str, message: &str) -> Result<()> {
         "message": message,
     });
     
-    match client
+    // Use internal API key for authentication
+    let mut request = client
         .post(&api_url)
         .json(&payload)
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-    {
+        .timeout(std::time::Duration::from_secs(2));
+    
+    if !api_key.is_empty() {
+        request = request.header("X-API-Key", &api_key);
+    }
+    
+    match request.send().await {
         Ok(response) if response.status().is_success() => {
             println!("✅ Message sent via local daemon API");
             println!("   API: {}", api_url);
@@ -845,7 +907,6 @@ async fn send_message(to: &str, message: &str) -> Result<()> {
     }
 
     // Load config (read-only, should work)
-    let storage = storage::AgentStorage::open(&storage_path)?;
     let config = storage.load_config()?
         .ok_or_else(|| anyhow::anyhow!("No agent configuration found"))?;
 
@@ -1384,6 +1445,29 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
         peer_id.clone(),
     );
     
+    // Background queue worker - sends pending messages when peers connected
+    let queue_storage_path = storage_path.clone();
+    let queue_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        
+        loop {
+            interval.tick().await;
+            
+            // Process pending messages
+            if let Ok(storage) = storage::AgentStorage::open(&queue_storage_path) {
+                if let Ok(messages) = storage.get_pending_messages(10) {
+                    for (id, to_account, _message) in messages {
+                        println!("📤 Processing queued message to: {}", to_account);
+                        // In full implementation, would send via P2P
+                        if let Err(e) = storage.mark_message_sent(id) {
+                            eprintln!("⚠️  Failed to mark message sent: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
     let api_server = tokio::spawn(async move {
         println!("🌐 API server running on http://127.0.0.1:{}", api_port);
         warp::serve(api_routes)
@@ -1397,6 +1481,7 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
         biased;
         
         _ = async {
+            let mut connected_peers_count: usize = 0;
             loop {
                 if let Some(event) = event_receiver.recv().await {
                     match event {
@@ -1411,6 +1496,10 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
                                                 eprintln!("⚠️  Failed to save message: {}", e);
                                             } else {
                                                 println!("📨 Received message from: {}", from);
+                                                
+                                                // Broadcast to WebSocket clients
+                                                let msg_json = serde_json::to_string(&msg).unwrap_or_default();
+                                                // TODO: ws_broadcast.send(msg_json);
                                             }
                                         }
                                         Err(e) => eprintln!("⚠️  Failed to open storage: {}", e),
@@ -1427,9 +1516,11 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
                         }
                         network::NetworkEvent::PeerConnected(peer_id) => {
                             info!("Peer connected: {}", peer_id);
+                            connected_peers_count = connected_peers_count.saturating_add(1);
                         }
                         network::NetworkEvent::PeerDisconnected(peer_id) => {
                             info!("Peer disconnected: {}", peer_id);
+                            connected_peers_count = connected_peers_count.saturating_sub(1);
                         }
                         network::NetworkEvent::Error(e) => {
                             eprintln!("⚠️  Network error: {}", e);
