@@ -11,8 +11,8 @@ name = "gork-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime (optimized features)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "signal"] }
 
 # HTTP API for daemon
 warp = "0.3"
@@ -21,8 +21,8 @@ warp = "0.3"
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 
-# P2P networking
-libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "relay", "macros", "tokio", "autonat", "dcutr", "rendezvous"] }
+# P2P networking (optimized features)
+libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "relay", "macros", "tokio"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -68,8 +68,9 @@ predicates = "3"
 
 [profile.release]
 codegen-units = 1
-opt-level = "z"
-lto = true
-debug = false
-panic = "abort"
+opt-level = "z"          # Optimize for size
+lto = true              # Link-time optimization
+debug = false           # No debug symbols
+panic = "abort"         # Smaller panic handling
 overflow-checks = true
+strip = true            # Strip symbols automatically (Rust 1.59+)
