@@ -249,6 +249,18 @@ enum Commands {
         #[command(subcommand)]
         action: MarketplaceCommands,
     },
+    
+    /// Manage API keys for HTTP API authentication
+    ApiKeys {
+        #[command(subcommand)]
+        action: ApiKeyCommands,
+    },
+    
+    /// Manage message queue for offline sending
+    Queue {
+        #[command(subcommand)]
+        action: QueueCommands,
+    },
 }
 
 /// Skills subcommands
@@ -327,6 +339,50 @@ enum ExecuteCommands {
 }
 
 /// Marketplace subcommands
+
+/// API key management subcommands
+#[derive(Subcommand)]
+enum ApiKeyCommands {
+    /// Create a new API key
+    Create {
+        /// Key name (for identification)
+        #[arg(short, long)]
+        name: String,
+        
+        /// Permissions (comma-separated: read,write,admin)
+        #[arg(short, long, default_value = "read,write")]
+        permissions: String,
+    },
+    
+    /// List all API keys
+    List,
+    
+    /// Revoke an API key
+    Revoke {
+        /// API key to revoke
+        key: String,
+    },
+}
+
+/// Message queue subcommands
+#[derive(Subcommand)]
+enum QueueCommands {
+    /// Show pending messages in queue
+    List {
+        /// Maximum results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    
+    /// Clear sent messages older than X days
+    Cleanup {
+        /// Days to keep
+        #[arg(short, long, default_value = "7")]
+        days: i64,
+    },
+}
+
+/// Marketplace subcommands
 #[derive(Subcommand)]
 enum MarketplaceCommands {
     /// List available skills on P2P network
@@ -401,6 +457,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Skills { action } => handle_skills_command(action).await,
         Commands::Execute { action } => handle_execute_command(action, &cli.registry, &cli.network).await,
         Commands::Marketplace { action } => handle_marketplace_command(action).await,
+        Commands::ApiKeys { action } => handle_api_key_command(action),
+        Commands::Queue { action } => handle_queue_command(action),
     }
 }
 
@@ -1773,5 +1831,114 @@ async fn rate_agent(agent: &str, rating: u32, registry_id: &str, network: &str) 
     println!();
     println!("💡 In production, this will be done automatically via the CLI");
 
+    Ok(())
+}
+
+fn handle_api_key_command(action: ApiKeyCommands) -> Result<()> {
+    let storage_path = get_storage_path();
+    if !storage_path.exists() {
+        println!("❌ No agent initialized. Run: gork-agent init --account <your.near>");
+        return Ok(());
+    }
+    
+    let storage = storage::AgentStorage::open(&storage_path)?;
+    
+    match action {
+        ApiKeyCommands::Create { name, permissions } => {
+            let key = storage.create_api_key(&name, &permissions)?;
+            println!("✅ API Key Created");
+            println!();
+            println!("   Name: {}", name);
+            println!("   Permissions: {}", permissions);
+            println!("   Key: {}", key);
+            println!();
+            println!("⚠️  Store this key securely - it won't be shown again!");
+            println!();
+            println!("Usage:");
+            println!("   curl -H \"X-API-Key: {}\" http://127.0.0.1:4002/api/v1/status", key);
+        }
+        ApiKeyCommands::List => {
+            let keys = storage.list_api_keys()?;
+            if keys.is_empty() {
+                println!("📭 No API keys found");
+                println!();
+                println!("Create one with: gork-agent api-keys create --name <name>");
+                return Ok(());
+            }
+            
+            println!("🔑 API Keys ({} total)", keys.len());
+            println!();
+            for (key, name, created, last_used) in keys {
+                let created_date = chrono::DateTime::from_timestamp(created, 0)
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| created.to_string());
+                
+                let last_used_str = last_used
+                    .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "Never".to_string());
+                
+                println!("┌─────────────────────────────────────");
+                println!("│ Name: {}", name);
+                println!("│ Key: {}...", &key[..20]);
+                println!("│ Created: {}", created_date);
+                println!("│ Last Used: {}", last_used_str);
+                println!("└─────────────────────────────────────");
+            }
+        }
+        ApiKeyCommands::Revoke { key } => {
+            if storage.revoke_api_key(&key)? {
+                println!("✅ API key revoked");
+            } else {
+                println!("❌ API key not found");
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_queue_command(action: QueueCommands) -> Result<()> {
+    let storage_path = get_storage_path();
+    if !storage_path.exists() {
+        println!("❌ No agent initialized. Run: gork-agent init --account <your.near>");
+        return Ok(());
+    }
+    
+    let storage = storage::AgentStorage::open(&storage_path)?;
+    
+    match action {
+        QueueCommands::List { limit } => {
+            let messages = storage.get_pending_messages(limit)?;
+            
+            if messages.is_empty() {
+                println!("📭 Message queue empty");
+                return Ok(());
+            }
+            
+            println!("📤 Message Queue ({} pending)", messages.len());
+            println!();
+            
+            for (id, to, message) in messages {
+                println!("┌─────────────────────────────────────");
+                println!("│ ID: {}", id);
+                println!("│ To: {}", to);
+                println!("│ Message: {}", if message.len() > 50 { 
+                    format!("{}...", &message[..50]) 
+                } else { 
+                    message 
+                });
+                println!("└─────────────────────────────────────");
+            }
+            
+            println!();
+            println!("💡 Messages will be sent when P2P connection is available");
+        }
+        QueueCommands::Cleanup { days } => {
+            let removed = storage.cleanup_queue(days)?;
+            println!("✅ Cleaned up {} sent messages older than {} days", removed, days);
+        }
+    }
+    
     Ok(())
 }

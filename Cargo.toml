@@ -17,6 +17,10 @@ tokio = { version = "1", features = ["full"] }
 # HTTP API for daemon
 warp = "0.3"
 
+# WebSocket support
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
 # P2P networking
 libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "relay", "macros", "tokio", "autonat", "dcutr", "rendezvous"] }
 

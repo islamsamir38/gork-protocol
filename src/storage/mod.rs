@@ -47,7 +47,27 @@ impl AgentStorage {
             );
             
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
-            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);",
+            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+            
+            CREATE TABLE IF NOT EXISTS api_keys (
+                key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_used INTEGER,
+                permissions TEXT NOT NULL DEFAULT 'read,write'
+            );
+            
+            CREATE TABLE IF NOT EXISTS message_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                to_account TEXT NOT NULL,
+                message TEXT NOT NULL,
+                queued_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_attempt INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_queue_status ON message_queue(status);",
         )?;
         
         Ok(Self {
@@ -277,6 +297,151 @@ impl AgentStorage {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM kv_store WHERE key = ?1", params![key])?;
         Ok(())
+    }
+    
+    // ========================================================================
+    // API Key Management
+    // ========================================================================
+    
+    /// Generate new API key
+    pub fn create_api_key(&self, name: &str, permissions: &str) -> Result<String> {
+        let key = format!("gork_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+        let created_at = chrono::Utc::now().timestamp();
+        
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (key, name, created_at, permissions) VALUES (?1, ?2, ?3, ?4)",
+            params![key, name, created_at, permissions],
+        )?;
+        
+        Ok(key)
+    }
+    
+    /// Validate API key
+    pub fn validate_api_key(&self, key: &str, required_permission: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        
+        let mut stmt = conn.prepare(
+            "SELECT permissions, last_used FROM api_keys WHERE key = ?1"
+        )?;
+        
+        let result = stmt.query_row(params![key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        });
+        
+        match result {
+            Ok((permissions, _last_used)) => {
+                // Check if key has required permission
+                let has_permission = permissions.split(',')
+                    .map(|s| s.trim())
+                    .any(|p| p == required_permission || p == "admin");
+                
+                if has_permission {
+                    // Update last_used
+                    let now = chrono::Utc::now().timestamp();
+                    conn.execute(
+                        "UPDATE api_keys SET last_used = ?1 WHERE key = ?2",
+                        params![now, key],
+                    )?;
+                }
+                
+                Ok(has_permission)
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+    
+    /// List all API keys
+    pub fn list_api_keys(&self) -> Result<Vec<(String, String, i64, Option<i64>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT key, name, created_at, last_used FROM api_keys ORDER BY created_at DESC"
+        )?;
+        
+        let keys = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        
+        Ok(keys)
+    }
+    
+    /// Revoke API key
+    pub fn revoke_api_key(&self, key: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute("DELETE FROM api_keys WHERE key = ?1", params![key])?;
+        Ok(rows > 0)
+    }
+    
+    // ========================================================================
+    // Message Queue (for offline sending)
+    // ========================================================================
+    
+    /// Queue message for later delivery
+    pub fn queue_message(&self, to_account: &str, message: &str) -> Result<i64> {
+        let queued_at = chrono::Utc::now().timestamp();
+        
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO message_queue (to_account, message, queued_at, status) VALUES (?1, ?2, ?3, 'pending')",
+            params![to_account, message, queued_at],
+        )?;
+        
+        Ok(conn.last_insert_rowid())
+    }
+    
+    /// Get pending messages from queue
+    pub fn get_pending_messages(&self, limit: usize) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, to_account, message FROM message_queue WHERE status = 'pending' ORDER BY queued_at ASC LIMIT ?1"
+        )?;
+        
+        let messages = stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        
+        Ok(messages)
+    }
+    
+    /// Mark message as sent
+    pub fn mark_message_sent(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE message_queue SET status = 'sent' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+    
+    /// Increment attempt counter
+    pub fn increment_attempts(&self, id: i64) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE message_queue SET attempts = attempts + 1, last_attempt = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        
+        let attempts: u32 = conn.query_row(
+            "SELECT attempts FROM message_queue WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        
+        Ok(attempts)
+    }
+    
+    /// Clean up old sent messages (older than days)
+    pub fn cleanup_queue(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - (days * 86400);
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM message_queue WHERE status = 'sent' AND queued_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(rows)
     }
 }
 
