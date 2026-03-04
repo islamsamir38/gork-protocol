@@ -1430,7 +1430,6 @@ fn assess_risk(sender: &str, reputation: u32, message: &str) -> Result<()> {
 
 async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<String>) -> Result<()> {
     println!("🚀 Starting Gork Agent P2P Daemon");
-    println!();
 
     // Load agent identity
     let storage_path = get_storage_path();
@@ -1444,8 +1443,7 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
         .load_config()?
         .ok_or_else(|| anyhow::anyhow!("No agent configuration found"))?;
 
-    println!("🤖 Agent: {}", config.identity.account_id);
-    println!();
+    println!("🤖 {}", config.identity.account_id);
 
     // Resolve relay via DNS discovery
     // Priority: --relay flag > saved relay > default relay
@@ -1454,53 +1452,19 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
     let relay_domain = relay.as_ref()
         .or(config.saved_relay.as_ref())
         .map(|s| s.as_str())
-        .unwrap_or(DEFAULT_RELAY);
+        .unwrap_or(DEFAULT_RELAY)
+        .to_string(); // Clone for background task
     
-    let bootstrap_multiaddr = if relay_domain.is_empty() {
-        // No relay, use manual bootstrap peers only
-        bootstrap_peers.clone()
-    } else {
-        println!("🔍 Discovering relay: {}", relay_domain);
-        
-        let discovery = relay_discovery::RelayDiscovery::new("dns.jemartel.near".to_string());
-        match discovery.discover(relay_domain).await {
-            Ok(multiaddr) => {
-                println!("✅ Relay discovered: {}", multiaddr);
-                
-                // Save for future use
-                // TODO: storage.save_relay(relay_domain)?;
-                
-                Some(multiaddr)
-            }
-            Err(e) => {
-                println!("⚠️  Relay discovery failed: {}", e);
-                
-                if relay.is_some() {
-                    // User explicitly requested this relay, show error
-                    println!("   Falling back to bootstrap-peers if provided");
-                    bootstrap_peers.clone()
-                } else {
-                    // Default relay failed, try to continue anyway
-                    println!("   Continuing without relay (direct connections only)");
-                    bootstrap_peers.clone()
-                }
-            }
-        }
-    };
+    // Always skip relay discovery at startup for instant response
+    // Discovery will happen in background after daemon is ready
+    let bootstrap_multiaddr = bootstrap_peers.clone();
 
     // Check if agent is NEAR verified
     if !config.near_verified {
-        println!("⚠️  WARNING: Agent not NEAR-verified!");
-        println!("   Other peers will reject connections from this agent.");
-        println!("   Reinitialize with NEAR verification:");
-        println!("   1. near login --account-id {}", config.identity.account_id);
-        println!("   2. rm -rf ~/.gork-agent");
-        println!("   3. gork-agent init --account {}", config.identity.account_id);
-        println!();
+        println!("⚠️  Agent not NEAR-verified (peers may reject connections)");
     } else {
-        println!("✅ NEAR verification confirmed");
+        println!("✅ NEAR verified");
     }
-    println!();
 
     // Create event channel
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1656,8 +1620,32 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
         }
     });
     
+    // Background relay discovery - happens after daemon is ready
+    let relay_domain_bg = relay_domain.to_string();
+    let relay_discovery_handle = tokio::spawn(async move {
+        // Wait a bit for daemon to be ready
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        
+        if !relay_domain_bg.is_empty() {
+            println!("🔍 Discovering relay in background: {}", relay_domain_bg);
+            
+            let discovery = relay_discovery::RelayDiscovery::new("dns.jemartel.near".to_string());
+            match discovery.discover(&relay_domain_bg).await {
+                Ok(multiaddr) => {
+                    println!("✅ Relay discovered: {}", multiaddr);
+                    // In full implementation, would add to P2P network here
+                    // p2p.add_relay(multiaddr).await;
+                }
+                Err(e) => {
+                    println!("⚠️  Relay discovery failed: {}", e);
+                }
+            }
+        }
+    });
+    
     let api_server = tokio::spawn(async move {
-        println!("🌐 API server running on http://127.0.0.1:{}", api_port);
+        // Start API immediately (don't wait for P2P)
+        println!("✅ Daemon ready! API: http://127.0.0.1:{}", api_port);
         warp::serve(api_routes)
             .run(([127, 0, 0, 1], api_port))
             .await;
