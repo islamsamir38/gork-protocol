@@ -29,7 +29,7 @@ near-crypto = "0.28"
 bs58 = "0.5"
 
 # Storage
-rocksdb = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Cryptography
 x25519-dalek = { version = "2", features = ["static_secrets"] }

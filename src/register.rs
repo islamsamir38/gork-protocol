@@ -38,13 +38,22 @@ pub async fn register_agent(
 
     // 3. Register on blockchain
     println!("📡 Registering on blockchain...");
-    println!("   Contract: {}", registry_contract);
+    
+    // Use Variant C registry (working on testnet)
+    let contract = if network == "mainnet" {
+        "registry.gork.near"
+    } else {
+        "registry-variant-c.testnet"
+    };
+    
+    println!("   Contract: {}", contract);
     println!("   Network: {}", network);
     println!();
 
-    let public_key_hex = hex::encode(&agent_public_key);
+    // Contract expects byte array, not hex string
+    let public_key_bytes: Vec<u8> = agent_public_key.to_vec();
     let args = serde_json::json!({
-        "public_key": public_key_hex
+        "public_key": public_key_bytes
     }).to_string();
 
     let network_flag = if network == "mainnet" { "--networkId" } else { "--networkId" };
@@ -53,7 +62,7 @@ pub async fn register_agent(
     let output = Command::new("near")
         .args([
             "call",
-            registry_contract,
+            contract,  // Use correct contract
             "register_agent_key",
             &args,
             "--accountId",

@@ -50,7 +50,7 @@ https://railway.com/project/78c74c9f-3e1d-4ad6-a09f-516dd89c31b1
    - **Fix:** Tried different user permission strategies
 
 4. **Attempt 6:** Config file format mismatch
-   - **Problem:** Created JSON, but relay uses RocksDB
+   - **Problem:** Created JSON, but relay used RocksDB (now SQLite)
    - **Fix:** Runtime initialization
 
 5. **Attempt 7:** Entrypoint script not in container
@@ -74,7 +74,7 @@ fi
 exec gork-agent relay --port 4001 --max-circuits 1000 --metrics --metrics-port 9090
 ```
 
-This initializes the RocksDB database on first run, then starts the relay.
+This initializes the database (now SQLite) on first run, then starts the relay.
 
 ---
 

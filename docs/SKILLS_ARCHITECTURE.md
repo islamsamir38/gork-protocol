@@ -45,7 +45,7 @@
 | ✅ P2P Network (gossipsub, DHT) | + Skill advertisements via gossipsub | Decentralized skill discovery |
 | ✅ NEAR identity/verification | + Skill registry on NEAR | Verified skill authors |
 | ✅ Encryption (X25519) | + Encrypted skill requests | Private skill execution |
-| ✅ Local storage (RocksDB) | + Skill cache | Downloaded skills offline |
+| ✅ Local storage (SQLite) | + Skill cache | Downloaded skills offline |
 | ✅ Messaging | + Skill request/response | Skill execution protocol |
 
 ## What You Need to Add

@@ -1,8 +1,9 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
 
 /// Agent registration for Variant C (certificate-based security)
-#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, JsonSchema)]
 pub struct AgentRegistration {
     /// Agent's P2P public key (separate from NEAR key)
     pub public_key: Vec<u8>,

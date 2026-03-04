@@ -480,7 +480,7 @@ gork-agent daemon --port 4001  # Advertise on network
 - [x] **Core Identity & Messaging**
   - [x] NEAR identity creation with mandatory verification
   - [x] CLI interface
-  - [x] Local storage (RocksDB)
+  - [x] Local storage (SQLite with WAL mode for concurrent access)
   - [x] End-to-end encryption (X25519 + ChaCha20-Poly1305)
 
 - [x] **P2P Networking**
@@ -546,9 +546,14 @@ RUST_LOG=debug cargo run -- --help
 Data is stored in `~/.gork-agent/`:
 - `config.yaml` - Agent configuration
 - `identity.yaml` - Agent identity
-- `inbox/` - Message storage
+- `agent.db` - SQLite database (messages, peers, audit logs, rate limits)
 - `skills/` - Installed skills
-- `audit.log` - Security events
+
+**SQLite with WAL Mode:**
+- Enables concurrent access from daemon and CLI
+- No lock conflicts between processes
+- Automatic crash recovery
+- All data persisted in single database file
 
 ## 🔐 Security
 

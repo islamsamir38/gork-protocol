@@ -371,7 +371,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => init_agent(&account, &cli.network, capabilities, dev_mode, private_key).await,
         Commands::Whoami => whoami(),
         Commands::Status => status(),
-        Commands::Send { to, message } => send_message(&to, &message),
+        Commands::Send { to, message } => send_message(&to, &message).await,
         Commands::Inbox { from, verbose } => show_inbox(from, verbose),
         Commands::Clear => clear_inbox(),
         Commands::Advertise { capability } => advertise(&capability),
@@ -405,8 +405,13 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 fn get_storage_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".gork-agent")
+    // Allow custom storage path via GORK_AGENT_HOME env var
+    if let Ok(custom) = std::env::var("GORK_AGENT_HOME") {
+        std::path::PathBuf::from(custom)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home).join(".gork-agent")
+    }
 }
 
 async fn init_agent(
@@ -555,6 +560,7 @@ async fn init_agent(
 
 /// Decode NEAR private key from base58 format
 /// NEAR uses "ed25519:<base58_key>" format
+/// NEAR stores keypair as 64 bytes (private + public), we need just private (32 bytes)
 fn decode_near_private_key(key: &str) -> Result<Vec<u8>> {
     let key = key.trim();
 
@@ -566,14 +572,18 @@ fn decode_near_private_key(key: &str) -> Result<Vec<u8>> {
     }
     .map_err(|_| anyhow::anyhow!("Invalid NEAR private key format"))?;
 
-    if key_bytes.len() != 32 {
-        return Err(anyhow::anyhow!(
-            "Invalid private key length: expected 32 bytes, got {}",
+    // NEAR stores full keypair (64 bytes): private (32) + public (32)
+    // Extract just the private key portion
+    if key_bytes.len() == 64 {
+        Ok(key_bytes[0..32].to_vec())
+    } else if key_bytes.len() == 32 {
+        Ok(key_bytes)
+    } else {
+        Err(anyhow::anyhow!(
+            "Invalid private key length: expected 32 or 64 bytes, got {}",
             key_bytes.len()
-        ));
+        ))
     }
-
-    Ok(key_bytes)
 }
 
 fn whoami() -> Result<()> {
@@ -644,46 +654,58 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-fn send_message(to: &str, message: &str) -> Result<()> {
+async fn send_message(to: &str, message: &str) -> Result<()> {
     let storage_path = get_storage_path();
     if !storage_path.exists() {
         println!("❌ No agent initialized. Run: gork-agent init --account <your.near>");
         return Ok(());
     }
 
-    let storage = storage::AgentStorage::open(&storage_path)?;
-
-    let config = storage
-        .load_config()?
-        .ok_or_else(|| anyhow::anyhow!("No agent configuration found"))?;
-
-    let crypto = crypto::MessageCrypto::new()?;
-
-    // Create message
-    let plain = types::PlainMessage::new(message.to_string());
-    let plaintext = plain.to_bytes();
-
-    let payload = types::EncryptedPayload {
-        ciphertext: plaintext.clone(),
-        nonce: vec![],
-        signature: crypto.sign(&plaintext)?,
-        sender_pubkey: crypto.public_key(),
-    };
-
-    let msg = types::Message::new(config.identity.account_id.clone(), to.to_string(), payload);
-
-    println!("📨 Message prepared");
-    println!("   From: {}", msg.from);
-    println!("   To: {}", msg.to);
-    println!("   ID: {}", msg.id);
-    println!();
+    println!("📨 Sending message to: {}", to);
     println!("   Content: {}", message);
     println!();
-    println!("⚠️  Note: P2P delivery not yet implemented (Phase 3)");
-    println!("   Message stored locally only");
 
-    // Store locally for now
-    storage.save_message(&msg)?;
+    // Load config (read-only, should work)
+    let storage = storage::AgentStorage::open(&storage_path)?;
+    let config = storage.load_config()?
+        .ok_or_else(|| anyhow::anyhow!("No agent configuration found"))?;
+
+    // Create temporary P2P network for sending
+    let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    
+    // Connect to local daemon on port 4001 with proper peer ID
+    // Note: For production, this should use a local IPC/HTTP API instead
+    let network_config = network::NetworkConfig {
+        port: 0, // Use random port for sender
+        bootstrap_peers: vec![],
+    };
+
+    let mut p2p = network::AgentNetwork::with_auth(
+        config.identity.clone(),
+        network_config,
+        event_sender,
+        None,
+        false, // Don't require auth for sender
+    ).await?;
+
+    // Start listening on random port
+    p2p.listen(None).await?;
+    
+    // Create message
+    let plain = types::PlainMessage::new(message.to_string());
+    let message_bytes = plain.to_bytes();
+
+    // Broadcast to gossipsub topic (will propagate to connected peers)
+    p2p.broadcast(network::GOSSIPSUB_TOPIC, &message_bytes).await?;
+
+    println!("✅ Message broadcast to P2P network");
+    println!("   Topic: {}", network::GOSSIPSUB_TOPIC);
+    println!();
+    println!("⚠️  Note: For reliable delivery, ensure recipient daemon is running");
+    println!("   Run 'gork-agent inbox' on recipient to check for messages");
+    
+    // Wait a bit for propagation
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     Ok(())
 }
@@ -1168,10 +1190,59 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
     // Create message handler
     let mut message_handler = network::MessageHandler::new(&config.identity.account_id);
 
+    // Clone storage path for use in async block
+    let storage_path = get_storage_path();
+
     // Run network event loop
     tokio::select! {
+        // Network runs in background, processing events internally
+        biased;
+        
+        _ = async {
+            loop {
+                if let Some(event) = event_receiver.recv().await {
+                    match event {
+                        network::NetworkEvent::MessageReceived { from, message } => {
+                            // Process incoming message through security layer
+                            match message_handler.handle_message(from.clone(), &message) {
+                                Ok(Some(msg)) => {
+                                    // Save to inbox
+                                    match storage::AgentStorage::open(&storage_path) {
+                                        Ok(storage) => {
+                                            if let Err(e) = storage.save_message(&msg) {
+                                                eprintln!("⚠️  Failed to save message: {}", e);
+                                            } else {
+                                                println!("📨 Received message from: {}", from);
+                                            }
+                                        }
+                                        Err(e) => eprintln!("⚠️  Failed to open storage: {}", e),
+                                    }
+                                }
+                                Ok(None) => {
+                                    // Message blocked by security
+                                    println!("🚫 Message from {} blocked by security", from);
+                                }
+                                Err(e) => {
+                                    eprintln!("⚠️  Failed to process message: {}", e);
+                                }
+                            }
+                        }
+                        network::NetworkEvent::PeerConnected(peer_id) => {
+                            info!("Peer connected: {}", peer_id);
+                        }
+                        network::NetworkEvent::PeerDisconnected(peer_id) => {
+                            info!("Peer disconnected: {}", peer_id);
+                        }
+                        network::NetworkEvent::Error(e) => {
+                            eprintln!("⚠️  Network error: {}", e);
+                        }
+                    }
+                }
+            }
+        } => {}
+
         _ = p2p_network.run() => {
-            // This will run forever until Ctrl+C
+            // Network finished (shouldn't happen)
         }
 
         _ = tokio::signal::ctrl_c() => {

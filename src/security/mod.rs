@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use regex::Regex;
 use std::path::Path;
-use rocksdb::{DB, Options};
+use rusqlite::{Connection, params};
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 // ============================================================================
@@ -52,7 +53,7 @@ impl Default for RateLimit {
 
 pub struct RateLimiter {
     limits: HashMap<String, RateLimit>,
-    db: Option<DB>,
+    db: Option<Arc<Mutex<Connection>>>,
 }
 
 impl RateLimiter {
@@ -63,25 +64,38 @@ impl RateLimiter {
         }
     }
 
-    /// Enable persistence with RocksDB
+    /// Enable persistence with SQLite
     pub fn with_persistence<P: AsRef<Path>>(mut self, path: P) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let db_path = path.as_ref().join("rate_limits.db");
+        let conn = Connection::open(&db_path)?;
         
-        let db = DB::open(&opts, path)?;
+        conn.pragma_update(None, "journal_mode", &"WAL")?;
+        conn.pragma_update(None, "busy_timeout", &5000)?;
         
-        // Load existing rate limits from DB
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, value) = item?;
-            if let Ok(account) = std::str::from_utf8(&key) {
-                if let Ok(limit) = serde_json::from_slice::<RateLimit>(&value) {
-                    self.limits.insert(account.to_string(), limit);
-                }
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rate_limits (
+                account TEXT PRIMARY KEY,
+                data BLOB NOT NULL
+            )",
+            [],
+        )?;
+        
+        // Load existing rate limits from DB - collect into vec first
+        let limits_data: Vec<(String, Vec<u8>)> = {
+            let mut stmt = conn.prepare("SELECT account, data FROM rate_limits")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        
+        for (account, data) in limits_data {
+            if let Ok(limit) = serde_json::from_slice::<RateLimit>(&data) {
+                self.limits.insert(account, limit);
             }
         }
         
-        self.db = Some(db);
+        self.db = Some(Arc::new(Mutex::new(conn)));
         info!("Loaded {} rate limits from persistence", self.limits.len());
         
         Ok(self)
@@ -89,9 +103,12 @@ impl RateLimiter {
 
     fn persist_limit(&self, account_id: &str, limit: &RateLimit) {
         if let Some(ref db) = self.db {
-            let key = account_id.as_bytes();
-            if let Ok(value) = serde_json::to_vec(limit) {
-                let _ = db.put(key, value);
+            if let Ok(data) = serde_json::to_vec(limit) {
+                let conn = db.lock().unwrap();
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO rate_limits (account, data) VALUES (?1, ?2)",
+                    params![account_id, data],
+                );
             }
         }
     }
@@ -528,7 +545,7 @@ pub struct AuditEntry {
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
     max_entries: usize,
-    db: Option<DB>,
+    db: Option<Arc<Mutex<Connection>>>,
     next_id: u64,
 }
 
@@ -542,25 +559,36 @@ impl AuditLog {
         }
     }
 
-    /// Enable persistence with RocksDB
+    /// Enable persistence with SQLite
     pub fn with_persistence<P: AsRef<Path>>(mut self, path: P) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let db_path = path.as_ref().join("audit_log.db");
+        let conn = Connection::open(&db_path)?;
         
-        let db = DB::open(&opts, path)?;
+        conn.pragma_update(None, "journal_mode", &"WAL")?;
+        conn.pragma_update(None, "busy_timeout", &5000)?;
         
-        // Load existing audit entries from DB
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audit_entries (
+                id INTEGER PRIMARY KEY,
+                data BLOB NOT NULL
+            )",
+            [],
+        )?;
+        
+        // Load existing audit entries from DB - collect into vec first
+        let mut entries_data: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = conn.prepare("SELECT id, data FROM audit_entries ORDER BY id")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        
         let mut max_id = 0u64;
-        for item in iter {
-            let (key, value) = item?;
-            if let Ok(id_str) = std::str::from_utf8(&key) {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    if let Ok(entry) = serde_json::from_slice::<AuditEntry>(&value) {
-                        self.entries.push(entry);
-                        max_id = max_id.max(id);
-                    }
-                }
+        for (id, data) in entries_data {
+            if let Ok(entry) = serde_json::from_slice::<AuditEntry>(&data) {
+                self.entries.push(entry);
+                max_id = max_id.max(id as u64);
             }
         }
         
@@ -573,7 +601,7 @@ impl AuditLog {
         }
         
         self.next_id = max_id + 1;
-        self.db = Some(db);
+        self.db = Some(Arc::new(Mutex::new(conn)));
         
         info!("Loaded {} audit entries from persistence", self.entries.len());
         
@@ -582,11 +610,15 @@ impl AuditLog {
 
     fn persist_entry(&mut self, entry: &AuditEntry) {
         if let Some(ref db) = self.db {
-            let key = self.next_id.to_string();
+            let id = self.next_id;
             self.next_id += 1;
             
             if let Ok(value) = serde_json::to_vec(entry) {
-                let _ = db.put(key.as_bytes(), value);
+                let conn = db.lock().unwrap();
+                let _ = conn.execute(
+                    "INSERT INTO audit_entries (id, data) VALUES (?1, ?2)",
+                    params![id as i64, value],
+                );
             }
         }
     }
@@ -611,12 +643,13 @@ impl AuditLog {
             
             // Clean up old entries from DB
             if let Some(ref db) = self.db {
-                // Delete oldest 100 entries
-                let delete_count = 100.min(self.next_id.saturating_sub(self.max_entries as u64));
-                for id in (self.next_id - delete_count)..self.next_id {
-                    let key = id.to_string();
-                    let _ = db.delete(key.as_bytes());
-                }
+                let conn = db.lock().unwrap();
+                // Delete oldest entries beyond max_entries
+                let delete_from = self.next_id.saturating_sub(self.max_entries as u64) as i64;
+                let _ = conn.execute(
+                    "DELETE FROM audit_entries WHERE id < ?1",
+                    params![delete_from],
+                );
             }
         }
     }
