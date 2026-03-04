@@ -1497,8 +1497,14 @@ async fn start_daemon(port: u16, bootstrap_peers: Option<String>, relay: Option<
         println!("   2. rm -rf ~/.gork-agent");
         println!("   3. gork-agent init --account {}", config.identity.account_id);
         println!();
-        println!("Starting anyway in 3 seconds... (Ctrl+C to cancel)");
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        
+        // Skip delay if environment variable set (for automation/CI)
+        if std::env::var("GORK_SKIP_DELAY").is_ok() {
+            println!("⚡ Skipping startup delay (GORK_SKIP_DELAY=1)");
+        } else {
+            println!("Starting in 1 second... (Ctrl+C to cancel, or set GORK_SKIP_DELAY=1)");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
         println!();
     } else {
         println!("✅ NEAR verification confirmed");
@@ -1787,8 +1793,14 @@ async fn start_relay(
         println!("⚠️  WARNING: Relay not NEAR-verified!");
         println!("   Peers may refuse to use this relay.");
         println!();
-        println!("Starting anyway in 3 seconds... (Ctrl+C to cancel)");
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        
+        // Skip delay if environment variable set (for automation/CI)
+        if std::env::var("GORK_SKIP_DELAY").is_ok() {
+            println!("⚡ Skipping startup delay (GORK_SKIP_DELAY=1)");
+        } else {
+            println!("Starting in 1 second... (Ctrl+C to cancel, or set GORK_SKIP_DELAY=1)");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
         println!();
     }
 
