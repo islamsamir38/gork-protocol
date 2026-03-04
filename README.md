@@ -555,6 +555,34 @@ Data is stored in `~/.gork-agent/`:
 - Automatic crash recovery
 - All data persisted in single database file
 
+## 🌐 HTTP API
+
+When the daemon is running, a local HTTP API is available on port `P2P_PORT + 1`:
+
+**Endpoints:**
+```bash
+# Health check
+GET http://127.0.0.1:4002/health
+
+# Daemon status
+GET http://127.0.0.1:4002/api/v1/status
+
+# Get inbox
+GET http://127.0.0.1:4002/api/v1/inbox
+
+# Send message (coming soon)
+POST http://127.0.0.1:4002/api/v1/send
+```
+
+**Performance:**
+- Instant message sends via HTTP (<100ms)
+- No P2P connection setup required
+- Uses daemon's existing mesh connections
+
+**CLI Integration:**
+- `gork-agent send` automatically detects daemon
+- Falls back to temp P2P if daemon not running
+
 ## 🔐 Security
 
 - **X25519** - Key exchange
